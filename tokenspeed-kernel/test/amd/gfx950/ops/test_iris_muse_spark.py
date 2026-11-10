@@ -357,6 +357,7 @@ def _muse_state(rank, device, max_rows, enable_lamport):
         enable_lamport=enable_lamport,
         owned_route_max_rows=0,
         intermediate_gather_max_rows=0,
+        attention_reduce_scatter_transport="cu",
         all_reduce=None,
         device=device,
     )
@@ -2703,6 +2704,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
+        attention_reduce_scatter_transport="cu",
         all_reduce=None,
         device=device,
     )
@@ -2899,6 +2901,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
+        attention_reduce_scatter_transport="cu",
         all_reduce=None,
         device=device,
     )
@@ -3081,6 +3084,7 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=2049,
         intermediate_gather_max_rows=capacity,
+        attention_reduce_scatter_transport="cu",
         all_reduce=None,
         device=device,
     )
@@ -3331,6 +3335,85 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
             )
     torch.cuda.synchronize()
     dist.barrier()
+
+
+def _muse_triggered_reduce_scatter_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication.iris import configure_iris
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        launch_gluon_mm_a16w16_prefill_gfx950,
+    )
+
+    configure_iris(heap_size=None, allocator_type=None, engines=("sdma",))
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=8192 * 8192,
+        enable_lamport=False,
+        owned_route_max_rows=0,
+        intermediate_gather_max_rows=0,
+        attention_reduce_scatter_transport="sdma",
+        all_reduce=None,
+        device=device,
+    )
+    trs = state.triggered_reduce_scatter
+    assert (trs.owner_pitch, trs.strips) == (8192 // world_size, 4)
+    state.warmup_triggered_reduce_scatter()
+    first_round = trs.plan.round
+    generator = torch.Generator(device=device).manual_seed(rank)
+    weight = (torch.randn((8192, 1024), generator=generator, device=device) / 32).to(
+        torch.bfloat16
+    )
+    producer = state.all_reduce.producer.data
+    served = 0
+    # Rows the plan serves (more than 6144) interleaved with rows it leaves to
+    # the CU path, for more rounds than the plan has strips.
+    for step, rows in enumerate((8192, 6145, 4096, 7001, 6144, 8191, 7777) * 10):
+        x = torch.randn((rows, 1024), generator=generator, device=device).to(
+            torch.bfloat16
+        )
+        partial = producer[: rows * 8192].view(rows, 8192)
+        assert (
+            launch_gluon_mm_a16w16_prefill_gfx950(
+                x, weight, torch.bfloat16, out=partial
+            )
+            is not None
+        )
+        expected = state.reduce_scatter_owned_rows(partial).clone()
+        serves = state.projects_reduce_scatter(rows)
+        assert serves == (rows > 6144)
+        if not serves:
+            continue
+        # Stale or early reads of either buffer would surface as NaN. The CU
+        # reduce-scatter's exit barrier has finished every peer's reads.
+        producer.fill_(float("nan"))
+        trs.inbox.fill_(float("nan"))
+        actual = state.project_reduce_scatter_owned_rows(x, weight)
+        assert torch.equal(actual, expected), f"step {step}, {rows} rows"
+        served += 1
+    torch.cuda.synchronize()
+    trs.raise_recorded_errors()
+    assert trs.plan.round == first_round + served
+    state.close()
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_muse_triggered_reduce_scatter_matches_the_cu_path(world_size):
+    """The SDMA projection + reduce-scatter returns the CU path's bits."""
+    _skip_if_unsupported(world_size, "Muse SDMA reduce-scatter")
+    pytest.importorskip("xio", reason="rocm-xio is required for SDMA")
+    try:
+        import iris.experimental.plan.gluon  # noqa: F401
+    except ImportError:
+        pytest.skip("Iris has no Gluon triggered plans")
+    _spawn_and_collect(
+        _communication_worker,
+        (world_size, _get_open_port(), _muse_triggered_reduce_scatter_worker, "nccl"),
+        world_size,
+    )
 
 
 @pytest.mark.parametrize(

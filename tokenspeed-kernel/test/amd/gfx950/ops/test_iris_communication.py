@@ -303,7 +303,7 @@ def _ar_worker_main(
             create_iris_state,
         )
 
-        configure_iris(heap_size=None, allocator_type=allocator_type)
+        configure_iris(heap_size=None, allocator_type=allocator_type, engines=())
         output_shape_cases = _ar_output_shape_cases()
         staged_max_numel = max(
             max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),

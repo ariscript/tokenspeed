@@ -196,6 +196,14 @@ been queued on the producer stream. Splitting a layer's DSA index-cache write
 into kernel-sized chunks does not add producer steps: only the final chunk
 publishes cache readiness.
 
+Iris's SDMA transport (`--iris-transport sdma`) follows the same shape inside
+a forward: the forward thread queues a layer's producer, consumer and round
+fence, then arms the next round's copy-engine transfers from the host while
+the GPU runs them. Nothing waits on the device; whether a batch uses the
+transport depends only on its row count, so every rank enters the collective
+fence for the same layers, and errors the device records surface at a later
+round instead of through a host sync.
+
 Common MoE weight processing reserves persistent DeepEP communication
 storage, before attention/cache construction profiles available memory. The
 kernel package owns allocation and compatible reuse. Every DeepEP backend

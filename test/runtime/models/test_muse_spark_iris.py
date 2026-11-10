@@ -1109,6 +1109,74 @@ def test_muse_runtime_collective_replay(check, backend, world_size):
     )
 
 
+def _muse_sdma_attention_reduce_scatter_worker(rank, world_size, device):
+    """The model's prepared SDMA transport projects and reduce-scatters o_proj.
+
+    Rows the plan serves agree with the CU path (hipBLASLt + pull kernel)
+    within BF16 rounding, since the two GEMMs sum K in different orders, and
+    advance the plan one round each; other rows take the CU path unchanged.
+    """
+    from tokenspeed_kernel.ops.communication.iris import configure_iris
+
+    from tokenspeed.runtime.layers.linear import RowParallelLinear
+    from tokenspeed.runtime.models.muse_spark import MuseSparkAttention
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.set_grad_enabled(False)
+    torch.set_default_dtype(torch.bfloat16)
+    configure_iris(heap_size=None, allocator_type=None, engines=("sdma",))
+    global_server_args_dict["iris_transport"] = "sdma"
+    group, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
+    trs = state.triggered_reduce_scatter
+    assert trs is not None
+    with torch.device(device):
+        o_proj = RowParallelLinear(
+            input_size=8192,
+            output_size=8192,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=None,
+            reduce_results=False,
+            quant_config=None,
+            prefix="o_proj",
+            tp_rank=rank,
+            tp_size=world_size,
+            tp_group=group,
+            use_presharded_weights=False,
+            override_kernel_name=None,
+        )
+    torch.manual_seed(31 + rank)
+    o_proj.weight.normal_(0, 0.03)
+    attention = object.__new__(MuseSparkAttention)
+    torch.nn.Module.__init__(attention)
+    attention.o_proj = o_proj
+    attention.iris_state = state
+    for rows in (8192, 7001, 4096, 6145):
+        x = torch.randn(rows, 8192 // world_size, device=device)
+        expected = state.reduce_scatter_owned_rows(attention._project(x)[0]).clone()
+        before = trs.plan.round
+        actual = attention._project_reduce_scatter(x, state).clone()
+        served = rows > 6144
+        assert trs.plan.round == before + served
+        torch.testing.assert_close(actual, expected, atol=2**-6, rtol=2**-6)
+        dist.barrier()
+    torch.cuda.synchronize()
+    trs.raise_recorded_errors()
+
+
+def test_muse_tp8_sdma_attention_reduce_scatter():
+    _skip_if_unsupported(8, "Muse SDMA attention reduce-scatter")
+    pytest.importorskip("xio", reason="rocm-xio is required for SDMA")
+    if importlib.util.find_spec("iris.experimental.plan") is None:
+        pytest.skip("Iris has no triggered plans")
+    _spawn_and_collect(
+        _communication_worker,
+        (8, _get_open_port(), _muse_sdma_attention_reduce_scatter_worker, "nccl"),
+        8,
+    )
+
+
 @pytest.mark.parametrize("down_columns", [False, True])
 def test_muse_tp8_owned_a4w4_forward(down_columns):
     _skip_if_unsupported(8, "Muse A4W4 owned forward")

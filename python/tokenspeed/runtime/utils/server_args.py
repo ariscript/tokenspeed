@@ -22,6 +22,7 @@
 
 import argparse
 import dataclasses
+import importlib.util
 import json
 import math
 import os
@@ -557,6 +558,10 @@ class ServerArgs:
     moe_mxfp4_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    # Where Iris moves Muse Spark's prefill attention reduce-scatter: "cu" in
+    # communication kernels, "sdma" on the copy engines through a triggered
+    # plan the projection GEMM releases strip by strip.
+    iris_transport: Literal["cu", "sdma"] = "cu"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
 
     # KVStore
@@ -2590,6 +2595,26 @@ class ServerArgs:
                     "than 1024"
                 )
 
+    def validate_iris_transport(self):
+        """Reject ``--iris-transport sdma`` where the copy engines cannot run it.
+
+        The SDMA transport opens copy-engine queues between every pair of
+        ranks, which rocm-xio supports for GPUs on one host, and its triggered
+        plan is collective over the whole world.
+        """
+        if self.iris_transport == "cu":
+            return
+        if self.iris_transport != "sdma":
+            raise ValueError(f"unknown --iris-transport {self.iris_transport!r}")
+        if not current_platform().is_cdna4:
+            raise ValueError("--iris-transport sdma needs AMD gfx950 GPUs")
+        if self.mapping.nnodes != 1:
+            raise ValueError("--iris-transport sdma needs every rank on one host")
+        if self.emulate_rank_zero:
+            raise ValueError("--iris-transport sdma needs real peers")
+        if importlib.util.find_spec("xio") is None:
+            raise ValueError("--iris-transport sdma needs rocm-xio (module xio)")
+
     def validate_rank_emulation(self):
         """Reject layouts ``--emulate-rank-zero`` cannot stand in for.
 
@@ -2760,6 +2785,7 @@ class ServerArgs:
                 raise ValueError("NPU execution requires --disable-pdl")
 
         self.validate_petit_moe_options()
+        self.validate_iris_transport()
         self.validate_rank_emulation()
         self.validate_prefill_delay()
 
@@ -3686,6 +3712,16 @@ class ServerArgs:
             help="MoE communication backend. agrs and flashinfer explicitly select "
             "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
             "Petit MegaMoE transport; none preserves existing behavior.",
+        )
+        parser.add_argument(
+            "--iris-transport",
+            type=str,
+            choices=["cu", "sdma"],
+            default=ServerArgs.iris_transport,
+            help="How Iris moves Muse Spark's TP prefill attention "
+            "reduce-scatter on gfx950: cu runs it in communication kernels; "
+            "sdma runs it on the SDMA copy engines, released strip by strip by "
+            "the output projection (needs rocm-xio and one host).",
         )
         parser.add_argument(
             "--deepep-mode",

@@ -849,6 +849,19 @@ class MuseSparkAttention(nn.Module):
         )
         self.iris_state: MuseIrisState | None = None
 
+    def _projects_into_producer(self, x: torch.Tensor) -> bool:
+        """Whether the projection is a plain BF16 GEMM whose TP sum is deferred."""
+        linear = self.o_proj
+        return (
+            linear.tp_size > 1
+            and type(linear.quant_method) is UnquantizedLinearMethod
+            and linear.bias is None
+            and linear.input_is_parallel
+            and not linear.reduce_results
+            and x.dtype == linear.weight.dtype
+            and not _gemm_dispatch_required()
+        )
+
     def _acquire_projection_output(self, x: torch.Tensor) -> torch.Tensor | None:
         """Borrow the all-reduce producer buffer for the projection, if compatible."""
         linear = self.o_proj
@@ -858,15 +871,23 @@ class MuseSparkAttention(nn.Module):
                 x,
                 linear.tp_group,
             )
-            if linear.tp_size > 1
-            and type(linear.quant_method) is UnquantizedLinearMethod
-            and linear.bias is None
-            and linear.input_is_parallel
-            and not linear.reduce_results
-            and x.dtype == linear.weight.dtype
-            and not _gemm_dispatch_required()
+            if self._projects_into_producer(x)
             else None
         )
+
+    def _project_reduce_scatter(
+        self, output: torch.Tensor, iris: MuseIrisState
+    ) -> torch.Tensor:
+        """Project attended rows and reduce-scatter them over owned rows.
+
+        The SDMA transport runs both as one operation for the row counts it
+        serves; otherwise the projection's partial goes to the CU reduce-scatter.
+        """
+        if self._projects_into_producer(output) and iris.projects_reduce_scatter(
+            output.shape[0]
+        ):
+            return iris.project_reduce_scatter_owned_rows(output, self.o_proj.weight)
+        return iris.reduce_scatter_owned_rows(self._project(output)[0])
 
     def _project_output(
         self,
@@ -887,8 +908,14 @@ class MuseSparkAttention(nn.Module):
         normalized: torch.Tensor,
         ctx: ForwardContext,
         owned_global_rows: int | None,
+        reduce_scatter_rows: int | None,
     ) -> tuple[torch.Tensor, int | None, int]:
-        """Attend over rows already passed through ``normalize``."""
+        """Attend over rows already passed through ``normalize``.
+
+        ``owned_global_rows`` is set when the QKV projection runs on owned
+        rows. ``reduce_scatter_rows`` is set when the output must come back
+        reduced over owned rows, the shard ``reduce_scatter_owned_rows`` returns.
+        """
         if owned_global_rows is not None:
             projected = self.qkv_proj.project_owned_rows(normalized, owned_global_rows)
             iris = self.iris_state
@@ -933,6 +960,7 @@ class MuseSparkAttention(nn.Module):
         projection_out = (
             self._acquire_projection_output(output)
             if output.shape[0] == 1
+            and reduce_scatter_rows is None
             and mv_weightless_rmsnorm_gated_sigmoid_supported(
                 output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
             )
@@ -956,6 +984,9 @@ class MuseSparkAttention(nn.Module):
             self.rms_norm_eps,
             pdl_enabled(),
         )
+        if reduce_scatter_rows is not None:
+            assert reduce_scatter_rows == output.shape[0]
+            return self._project_reduce_scatter(output, self.iris_state), None, 1
         return self._project(output)
 
     def forward_sliding_tail(
@@ -2119,11 +2150,12 @@ class MuseSparkDecoderLayer(nn.Module):
                 attention_input,
                 ctx,
                 owned_global_rows if owned_qkvg else None,
+                owned_global_rows,
             )
-            if owned_global_rows is not None:
-                attention_output = iris.reduce_scatter_owned_rows(attention_output)
-            elif (
-                self.self_attn.o_proj.tp_size > 1
+            # Owned rows come back already reduced over the group.
+            if (
+                owned_global_rows is None
+                and self.self_attn.o_proj.tp_size > 1
                 and not self.self_attn.o_proj.reduce_results
                 and self.pre_feedforward_layernorm.weight is not None
                 and self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
@@ -2830,6 +2862,9 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 enable_lamport=True,
                 owned_route_max_rows=owned_route_max_rows,
                 intermediate_gather_max_rows=intermediate_gather_max_rows,
+                attention_reduce_scatter_transport=global_server_args_dict[
+                    "iris_transport"
+                ],
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
@@ -2852,6 +2887,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         self.model.iris_state = state
         # Startup might not reduce any payload in the two-shot pull's window.
         state.warmup_reduce_outputs()
+        # Nor run a batch the SDMA reduce-scatter serves; compile and check it.
+        state.warmup_triggered_reduce_scatter()
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state

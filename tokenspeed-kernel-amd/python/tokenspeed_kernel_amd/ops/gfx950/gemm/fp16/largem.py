@@ -722,6 +722,122 @@ def gluon_mm_a16w16_prefill_publish_rows_gfx950(
             )
 
 
+# M and the owned-row count follow the token count and stay runtime arguments.
+@gluon.jit(
+    launch_metadata=_dense16_mm_launch_metadata,
+    do_not_specialize=("M", "OWNED_ROWS"),
+)
+def gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    counters,
+    strip_arrivals,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    OWNED_ROWS,
+    OWNER_PITCH: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+):
+    """``gluon_mm_a16w16_prefill_gfx950`` storing owner rows pitched and marking strips.
+
+    Owner ``q`` owns rows ``[q * OWNED_ROWS, (q + 1) * OWNED_ROWS)`` of ``A``
+    (fewer for the last owners when ``M`` is short), split into strips of
+    ``BLOCK_M`` rows; the grid covers ``OWNER_PITCH / BLOCK_M`` strips. Strip ``s`` of owner ``q`` lands at row
+    ``q * OWNER_PITCH + s * BLOCK_M`` of ``C``, so every strip has a fixed
+    place whatever ``M`` is. Workgroups take strip ``s`` of every owner,
+    this rank's own last, before strip ``s + 1``.
+
+    Strip ``s`` of the ``j``-th following owner is chunk ``s * (WORLD_SIZE -
+    1) + j`` of this rank's triggered plan. Each of its column tiles stores
+    write-through and counts itself in ``strip_arrivals``; the last one resets
+    that count and adds 1 to ``counters[chunk]``, so a chunk has a single
+    writer however many column tiles it has. Own strips are not marked. Every
+    tile does the full GEMM's work for its rows, so the bits match.
+    """
+    pid = gl.program_id(0)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    order_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    strip = order_m // WORLD_SIZE
+    step = order_m % WORLD_SIZE
+    owner = (RANK + 1 + step) % WORLD_SIZE
+    owner_rows = gl.minimum(OWNED_ROWS, gl.maximum(M - owner * OWNED_ROWS, 0))
+    valid = gl.minimum(gl.maximum(owner_rows - strip * BLOCK_M, 0), BLOCK_M)
+    # A strip past a short last owner computes row 0 and stores nothing, but
+    # still marks, since the plan sends every strip.
+    row_base = (owner * OWNED_ROWS + strip * BLOCK_M) * (valid > 0).to(gl.int32)
+    col_base = pid_n * BLOCK_N
+    acc_tl, acc_bl, acc_tr, acc_br = largem_mfma_lds_tile(
+        a_ptr,
+        b_ptr,
+        row_base,
+        col_base,
+        gl.maximum(valid, 1) - 1,
+        N - 1 - col_base,
+        BLOCK_N // 2,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+    )
+    c_strip = c_ptr + (owner * OWNER_PITCH + strip * BLOCK_M).to(gl.int64) * stride_cm
+    _largem_store_tile(
+        c_strip,
+        acc_tl,
+        acc_bl,
+        acc_tr,
+        acc_br,
+        0,
+        col_base,
+        valid,
+        N,
+        stride_cm,
+        1,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        CACHE=".wt",
+    )
+    if step != WORLD_SIZE - 1:
+        chunk = strip * (WORLD_SIZE - 1) + step
+        # Every subgroup's write-through stores land before the tile counts.
+        gl.inline_asm_elementwise(
+            "s_waitcnt vmcnt(0)",
+            "=r,~{memory}",
+            [],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        gl.barrier()
+        # The copy engines read behind L2, so each tile's release writes back
+        # its own XCD's L2 before the last tile's release marks the chunk.
+        seen = gl.atomic_add(strip_arrivals + chunk, 1, sem="acq_rel", scope="sys")
+        if seen == num_pid_n - 1:
+            gl.atomic_xchg(strip_arrivals + chunk, 0, sem="relaxed", scope="gpu")
+            gl.atomic_add(counters + chunk, 1, sem="release", scope="sys")
+
+
 @gluon.jit
 def _largem_store_tile(
     c_ptr,
@@ -983,6 +1099,105 @@ def launch_gluon_mm_a16w16_prefill_publish_rows_gfx950(
         C.stride(1),
         tiles_per_owner,
         RANK=rank,
+        BLOCK_M=LARGEM_BLOCK_M,
+        BLOCK_N=LARGEM_BLOCK_N,
+        BLOCK_K=LARGEM_BLOCK_K,
+        WARPS_M=LARGEM_WARPS_M,
+        WARPS_N=LARGEM_WARPS_N,
+        num_warps=LARGEM_NUM_WARPS,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return C
+
+
+def launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    counters: torch.Tensor,
+    strip_arrivals: torch.Tensor,
+    *,
+    owned_rows: int,
+    owner_pitch: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor | None:
+    """Compute ``A @ B.T`` with the large-M GEMM's bits into owner-pitched rows.
+
+    Owner ``q``'s rows ``[q * owned_rows, (q + 1) * owned_rows)`` of ``A`` land
+    at rows ``[q * owner_pitch, ...)`` of ``out`` (``[world_size * owner_pitch,
+    N]``), in strips of ``LARGEM_BLOCK_M`` rows. Strip ``s`` of the ``j``-th
+    owner after ``rank`` marks ``counters[s * (world_size - 1) + j]`` once, when
+    its last column tile is stored; ``strip_arrivals`` (int32, one per chunk,
+    zero between launches) counts the column tiles. Returns None (launching
+    nothing) for unsupported operands.
+
+    Args:
+        A: Activations ``[M, K]``.
+        B: Weight ``[N, K]``.
+        out: Destination ``[world_size * owner_pitch, N]``, contiguous rows.
+        counters: This rank's triggered-plan counters, one int32 per chunk.
+        strip_arrivals: Scratch int32 per chunk, zero before the launch and
+            left zero after it.
+        owned_rows: Rows per owner, ``ceil(M / world_size)``.
+        owner_pitch: Rows reserved per owner in ``out``, a multiple of
+            ``LARGEM_BLOCK_M`` of at least ``owned_rows``.
+        rank: This rank.
+        world_size: Number of owners.
+
+    Returns:
+        ``out``, or None when the operands are unsupported.
+    """
+    if (
+        A.ndim != 2
+        or B.ndim != 2
+        or A.dtype not in _SUPPORTED_DTYPES
+        or B.dtype != A.dtype
+        or not A.is_cuda
+        or not B.is_cuda
+        or not 0 <= rank < world_size
+        or owner_pitch % LARGEM_BLOCK_M
+        or counters.dtype != torch.int32
+        or strip_arrivals.dtype != torch.int32
+        or counters.device != A.device
+        or strip_arrivals.device != A.device
+    ):
+        return None
+    M, K = A.shape
+    N, K_b = B.shape
+    strips = owner_pitch // LARGEM_BLOCK_M
+    chunks = strips * (world_size - 1)
+    if (
+        K_b != K
+        or not _supports_largem_shape(M, N, K)
+        or owned_rows != triton.cdiv(M, world_size)
+        or not 0 < owned_rows <= owner_pitch
+        or counters.numel() < chunks
+        or strip_arrivals.numel() < chunks
+    ):
+        return None
+    C = _resolve_largem_output(A, world_size * owner_pitch, N, A.dtype, out)
+    # Strip bases advance in int64; offsets inside a strip stay int32.
+    assert LARGEM_BLOCK_M * N < 2**31
+    grid = world_size * strips * triton.cdiv(N, LARGEM_BLOCK_N)
+    gluon_mm_a16w16_prefill_mark_owner_rows_gfx950[(grid,)](
+        A,
+        B,
+        C,
+        counters,
+        strip_arrivals,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        owned_rows,
+        OWNER_PITCH=owner_pitch,
+        RANK=rank,
+        WORLD_SIZE=world_size,
         BLOCK_M=LARGEM_BLOCK_M,
         BLOCK_N=LARGEM_BLOCK_N,
         BLOCK_K=LARGEM_BLOCK_K,

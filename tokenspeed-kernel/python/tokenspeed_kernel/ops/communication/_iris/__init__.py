@@ -41,25 +41,37 @@ HEAP_HEADROOM_BYTES = 16 << 20
 _context = None
 _heap_size: int | None = None
 _allocator_type: str | None = None
+_engines: tuple[str, ...] = ()
 _spans_hosts: bool | None = None
 _unmapped_reason: str | None = None
 
 
-def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None:
+def configure_iris(
+    *, heap_size: int | None, allocator_type: str | None, engines: tuple[str, ...]
+) -> None:
     """Set heap options before preparation; None picks the allocator.
 
     None means vmem_chunked when the world spans hosts and Iris's torch default
     otherwise. A name is passed unchanged to Iris, whose IRIS_ALLOCATOR override
-    takes precedence. Neither option may change a live heap.
+    takes precedence. ``engines`` are the copy engines the heap opens, ``()`` or
+    ``("sdma",)``. No option may change a live heap.
     """
-    global _heap_size, _allocator_type
-    if _context is not None and (heap_size, allocator_type) != (
+    global _heap_size, _allocator_type, _engines
+    engines = tuple(engines)
+    if _context is not None and (heap_size, allocator_type, engines) != (
         _heap_size,
         _allocator_type,
+        _engines,
     ):
         raise RuntimeError("Configure Iris before preparing communication buffers")
     _heap_size = heap_size
     _allocator_type = allocator_type
+    _engines = engines
+
+
+def copy_engines() -> tuple[str, ...]:
+    """The copy engines the shared context opens (or will open)."""
+    return _engines
 
 
 def allocation_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -157,6 +169,9 @@ def get_or_create_context(*, heap_size: int):
             # Only vmem_chunked maps peers on other hosts.
             allocator_type = "vmem_chunked"
         options = {} if allocator_type is None else {"allocator_type": allocator_type}
+        if _engines:
+            # Iris releases before triggered plans take no engines argument.
+            options["engines"] = _engines
         _context = iris.iris(
             heap_size=size, device=torch.cuda.current_device(), **options
         )

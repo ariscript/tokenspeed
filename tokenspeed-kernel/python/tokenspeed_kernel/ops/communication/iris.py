@@ -57,7 +57,12 @@ _PRODUCER_DIRECT_GL_DTYPES = {
 IRIS_AR_RMSNORM_STATES: dict = {}
 
 
-def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None:
+def configure_iris(
+    *,
+    heap_size: int | None,
+    allocator_type: str | None,
+    engines: tuple[str, ...],
+) -> None:
     """Configure the shared context before preparing any Iris collective.
 
     Args:
@@ -65,10 +70,13 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
         allocator_type: Iris allocator name, or None for ``vmem_chunked`` when
             the world spans hosts and Iris's ``torch`` default otherwise. Iris's
             ``IRIS_ALLOCATOR`` environment override retains its normal precedence.
+        engines: Copy engines the context opens: ``()`` for none, or
+            ``("sdma",)`` for the SDMA engines that triggered-plan transports
+            use, which needs rocm-xio and every rank on one host.
     """
     from tokenspeed_kernel.ops.communication._iris import configure_iris as configure
 
-    configure(heap_size=heap_size, allocator_type=allocator_type)
+    configure(heap_size=heap_size, allocator_type=allocator_type, engines=engines)
 
 
 def discover_iris_world() -> bool:

@@ -109,6 +109,13 @@ _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS = 32
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
+# The attention output projection's reduction width per rank: 128 heads x 64.
+_MUSE_ATTENTION_OUTPUT_WIDTH = 8192
+# Fewest rows the SDMA attention reduce-scatter serves; fewer stay on the CU
+# pull kernel.
+_MUSE_TRIGGERED_REDUCE_SCATTER_MIN_ROWS = _MUSE_OWNED_MIN_ROWS
+# How long the SDMA plan's waits and round fence wait before recording an error.
+_MUSE_TRIGGERED_TIMEOUT_SECONDS = 60.0
 _MUSE_ROW_GATHER_PROGRAMS = 128
 _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
@@ -166,6 +173,7 @@ class MuseIrisState:
         enable_lamport: bool,
         owned_route_max_rows: int,
         intermediate_gather_max_rows: int,
+        attention_reduce_scatter_transport: str,
     ) -> int:
         rows = min(max_numel // _MUSE_BOUNDARY_WIDTH, _MUSE_BOUNDARY_MAX_ROWS)
         size = ProducerAllReduce.heap_bytes(
@@ -210,7 +218,34 @@ class MuseIrisState:
         if MuseIrisState._attntail_supported(world_size, enable_lamport):
             for shape, dtype in MuseIrisState._attntail_buffers(world_size):
                 size += allocation_bytes(shape, dtype)
+        pitch = MuseIrisState._triggered_owner_pitch(
+            max_numel, world_size, attention_reduce_scatter_transport
+        )
+        if pitch:
+            # The peers' strips land in an inbox; the plan's gates fit the headroom.
+            size += allocation_bytes(
+                (world_size - 1, pitch, _MUSE_BOUNDARY_WIDTH), torch.bfloat16
+            )
         return size
+
+    @staticmethod
+    def _triggered_owner_pitch(
+        max_numel: int, world_size: int, attention_reduce_scatter_transport: str
+    ) -> int:
+        """Rows per owner of the SDMA attention reduce-scatter, or 0 without it.
+
+        Owners' rows sit at fixed pitched offsets of the producer buffer, so the
+        pitch is the largest multiple of 256 rows that fits world_size times.
+        """
+        if attention_reduce_scatter_transport not in ("cu", "sdma"):
+            raise ValueError(
+                f"unknown attention reduce-scatter transport "
+                f"{attention_reduce_scatter_transport!r}"
+            )
+        if attention_reduce_scatter_transport == "cu":
+            return 0
+        rows = max_numel // _MUSE_BOUNDARY_WIDTH
+        return rows // world_size // 256 * 256
 
     @staticmethod
     def _attntail_supported(world_size: int, enable_lamport: bool) -> bool:
@@ -290,6 +325,7 @@ class MuseIrisState:
         enable_lamport: bool,
         owned_route_max_rows: int,
         intermediate_gather_max_rows: int,
+        attention_reduce_scatter_transport: str,
     ):
         self._arch = iris_arch_policy()
         self.all_reduce = all_reduce
@@ -490,6 +526,35 @@ class MuseIrisState:
             self.attntail_counters = torch.zeros(
                 _MUSE_ATTNTAIL_MAX_ROWS // 8 * 2, dtype=torch.int32, device=peers.device
             )
+        # The attention output's projection + reduce-scatter on the SDMA copy
+        # engines, for the row counts its triggered plan serves.
+        self.attention_reduce_scatter_transport = attention_reduce_scatter_transport
+        self.triggered_reduce_scatter = None
+        pitch = self._triggered_owner_pitch(
+            capacity, self.world_size, attention_reduce_scatter_transport
+        )
+        if pitch:
+            if not self.row_boundary_supported:
+                raise ValueError("the SDMA reduce-scatter needs the owned-row path")
+            ranks = dist.get_process_group_ranks(all_reduce.group)
+            if ranks != list(range(peers.ctx.get_num_ranks())):
+                # A triggered plan is collective over the whole Iris world.
+                raise ValueError(
+                    "the SDMA reduce-scatter needs the group to be the world"
+                )
+            # Imported only here: it needs Iris triggered plans and rocm-xio.
+            from tokenspeed_kernel.ops.communication._iris.triggered_reduce_scatter import (
+                TriggeredOwnedRowsReduceScatter,
+            )
+
+            self.triggered_reduce_scatter = TriggeredOwnedRowsReduceScatter(
+                peers.ctx,
+                all_reduce.producer.data,
+                owner_pitch=pitch,
+                width=_MUSE_BOUNDARY_WIDTH,
+                min_rows=_MUSE_TRIGGERED_REDUCE_SCATTER_MIN_ROWS,
+                timeout=_MUSE_TRIGGERED_TIMEOUT_SECONDS,
+            )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy.
@@ -649,6 +714,59 @@ class MuseIrisState:
         return self.all_reduce.producer.data[start : start + local_rows * width].view(
             local_rows, width
         )
+
+    def projects_reduce_scatter(self, rows: int) -> bool:
+        """Whether ``project_reduce_scatter_owned_rows`` serves ``rows`` now.
+
+        Only the SDMA transport does, for the row counts its triggered plan
+        serves, outside graph capture. The answer depends only on the row count
+        and capture state, so every rank gives the same one.
+        """
+        trs = self.triggered_reduce_scatter
+        return (
+            trs is not None
+            and trs.serves(rows)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def project_reduce_scatter_owned_rows(
+        self, x: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Reduce-scatter ``x @ weight.T`` over owned rows on the SDMA engines.
+
+        The projection marks owner strips as it stores them, and the copy
+        engines deliver each strip to its owner while the projection runs.
+        Returns the owned rows as ``reduce_scatter_owned_rows`` does. Call only
+        when ``projects_reduce_scatter(rows)``.
+        """
+        trs = self.triggered_reduce_scatter
+        assert self.projects_reduce_scatter(x.shape[0])
+        output = self.all_reduce.producer_pull.scratch[
+            : triton.cdiv(x.shape[0], self.world_size) * trs.width
+        ].view(-1, trs.width)
+        return trs.run(x, weight, output)
+
+    def warmup_triggered_reduce_scatter(self) -> None:
+        """Run and check one SDMA round before serving, compiling its kernels."""
+        trs = self.triggered_reduce_scatter
+        if trs is None:
+            return
+        device = self.all_reduce.device
+        x = torch.zeros(
+            (trs.max_rows, _MUSE_ATTENTION_OUTPUT_WIDTH // self.world_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        weight = torch.zeros(
+            (trs.width, x.shape[1]), dtype=torch.bfloat16, device=device
+        )
+        trs.warmup(x, weight)
+
+    def close(self) -> None:
+        """Collective: release the SDMA plan, raising any error it recorded."""
+        if self.triggered_reduce_scatter is not None:
+            self.triggered_reduce_scatter.close()
+            self.triggered_reduce_scatter = None
 
     def reduce_scatter_owned_rows(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce full BF16 rows and finish all peer reads before returning."""
@@ -2419,6 +2537,7 @@ def prepare_muse_communication(
     enable_lamport: bool,
     owned_route_max_rows: int,
     intermediate_gather_max_rows: int,
+    attention_reduce_scatter_transport: str,
     all_reduce: IrisAllReduce | None,
     device: torch.device,
 ) -> MuseIrisState:
@@ -2449,6 +2568,7 @@ def prepare_muse_communication(
         enable_lamport=enable_lamport,
         owned_route_max_rows=owned_route_max_rows,
         intermediate_gather_max_rows=intermediate_gather_max_rows,
+        attention_reduce_scatter_transport=attention_reduce_scatter_transport,
     )
     if all_reduce is None:
         size += IrisAllReduce.heap_bytes(
@@ -2464,6 +2584,7 @@ def prepare_muse_communication(
         enable_lamport=enable_lamport,
         owned_route_max_rows=owned_route_max_rows,
         intermediate_gather_max_rows=intermediate_gather_max_rows,
+        attention_reduce_scatter_transport=attention_reduce_scatter_transport,
     )
     all_reduce.peers.finish_prepare()
     return state

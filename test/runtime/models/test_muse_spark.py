@@ -1050,7 +1050,7 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
     )
     monkeypatch.setattr(module, "pdl_enabled", lambda: False)
     positions, ctx = torch.arange(3), SimpleNamespace()
-    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None)
+    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None, None)
     q, k, v, positions_arg, ctx_arg = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, rows[:, :q_end])
@@ -1163,7 +1163,7 @@ def test_owned_attention_stores_prepared_rows_once(
             dtype=torch.bfloat16, kv_write_target=write_target
         ),
     )
-    output, sentinel, ranks = attention(positions, local, ctx, rows)
+    output, sentinel, ranks = attention(positions, local, ctx, rows, None)
     assert sentinel is None and ranks == 1
     assert torch.equal(output, prepared_q)
     assert len(write_targets) == 1
@@ -1685,6 +1685,7 @@ def _gathered_mxfp4_workspace_worker(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
+            attention_reduce_scatter_transport="cu",
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
