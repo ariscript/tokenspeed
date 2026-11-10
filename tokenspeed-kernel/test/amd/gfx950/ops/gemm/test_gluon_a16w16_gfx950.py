@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.gemm import bmm, kimi3_router_projection, mm  # noqa:
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
+    launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950,
     launch_gluon_mm_a16w16_prefill_publish_rows_gfx950,
     launch_gluon_mm_a16w16_prefill_skip_rows_gfx950,
     supports_gluon_mm_a16w16_prefill_gfx950,
@@ -291,6 +292,91 @@ def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
             is None
         )
     assert counters.tolist() == expected
+
+
+@pytest.mark.parametrize("m", [6145, 6151, 7000, 7777, 8191, 8192, 1500])
+def test_largem_mark_owner_rows_pitches_rows_and_marks_each_strip_once(m) -> None:
+    world, rank, pitch, n = 8, 5, 1024, 8192
+    torch.manual_seed(m)
+    a = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, 1024), device="cuda", dtype=torch.bfloat16) / 32
+    full = launch_gluon_mm_a16w16_prefill_gfx950(a, b, torch.bfloat16)
+    owned = -(-m // world)
+    strips = pitch // 256
+    out = torch.full((world * pitch, n), 7.0, device="cuda", dtype=torch.bfloat16)
+    counters = torch.full((strips * (world - 1),), -3, device="cuda", dtype=torch.int32)
+    arrivals = torch.zeros_like(counters)
+    for call in (1, 2):
+        assert (
+            launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
+                a,
+                b,
+                out,
+                counters,
+                arrivals,
+                owned_rows=owned,
+                owner_pitch=pitch,
+                rank=rank,
+                world_size=world,
+            )
+            is out
+        )
+        # Every strip of every other owner is marked exactly once per call,
+        # including strips a short last owner leaves empty.
+        assert counters.tolist() == [-3 + call] * counters.numel()
+        assert not arrivals.any()
+    for owner in range(world):
+        rows = max(0, min(owned, m - owner * owned))
+        placed = out[owner * pitch : owner * pitch + rows]
+        torch.testing.assert_close(
+            placed, full[owner * owned : owner * owned + rows], atol=0, rtol=0
+        )
+        assert torch.all(out[owner * pitch + rows : (owner + 1) * pitch] == 7.0)
+    # A pitch off the strips, a wrong owned-row count, or too few counters
+    # launch nothing.
+    for kwargs, chunks in (
+        (dict(owned_rows=owned, owner_pitch=pitch + 8), counters),
+        (dict(owned_rows=owned + 1, owner_pitch=pitch), counters),
+        (dict(owned_rows=owned, owner_pitch=pitch), counters[:-1]),
+    ):
+        assert (
+            launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
+                a, b, out, chunks, arrivals, rank=rank, world_size=world, **kwargs
+            )
+            is None
+        )
+
+
+def test_largem_mark_owner_rows_does_not_recompile_across_row_counts() -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        gluon_mm_a16w16_prefill_mark_owner_rows_gfx950,
+    )
+
+    world, pitch, n = 8, 1024, 8192
+    b = torch.randn((n, 1024), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((world * pitch, n), device="cuda", dtype=torch.bfloat16)
+    counters = torch.zeros(4 * (world - 1), device="cuda", dtype=torch.int32)
+    arrivals = torch.zeros_like(counters)
+
+    def launch(m):
+        a = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
+        launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
+            a,
+            b,
+            out,
+            counters,
+            arrivals,
+            owned_rows=-(-m // world),
+            owner_pitch=pitch,
+            rank=2,
+            world_size=world,
+        )
+
+    launch(8192)
+    with assert_no_triton_compile(gluon_mm_a16w16_prefill_mark_owner_rows_gfx950):
+        for m in (6145, 7001, 7999, 8184):
+            launch(m)
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(

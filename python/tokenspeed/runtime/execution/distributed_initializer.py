@@ -99,6 +99,8 @@ class DistributedConfig:
 
     # --batch-invariant-collectives: every all-reduce folds ranks in order.
     batch_invariant_collectives: bool
+    # Copy engines the Iris heap opens: ("sdma",) for --iris-transport sdma.
+    iris_engines: tuple[str, ...]
 
     dist_init_addr: str | None = None
     distributed_timeout_seconds: int = 1800
@@ -148,6 +150,7 @@ class DistributedConfig:
                 else 0
             ),
             batch_invariant_collectives=server_args.batch_invariant_collectives,
+            iris_engines=("sdma",) if server_args.iris_transport == "sdma" else (),
             dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
@@ -253,8 +256,14 @@ class DistributedInitializer:
         # builds lack. The heap spans the world; routing reads whether it can
         # map it.
         if current_platform().is_amd:
-            from tokenspeed_kernel.ops.communication.iris import discover_iris_world
+            from tokenspeed_kernel.ops.communication.iris import (
+                configure_iris,
+                discover_iris_world,
+            )
 
+            configure_iris(
+                heap_size=None, allocator_type=None, engines=config.iris_engines
+            )
             discover_iris_world()
 
         # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.

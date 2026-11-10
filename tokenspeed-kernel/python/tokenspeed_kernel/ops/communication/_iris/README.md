@@ -93,18 +93,49 @@ the partials of columns [512q, 512q + 512) of every route and publishes them
 with their partial sums of squares, then every rank normalizes, weights,
 and sums all columns.
 
+## SDMA transport
+
+`triggered_reduce_scatter.py` runs Muse's owned-row attention projection and
+reduce-scatter on the SDMA copy engines (`--iris-transport sdma`; the heap is
+configured with `engines=("sdma",)`). The output projection writes each
+owner's rows at a fixed pitch in the producer buffer and marks every strip of
+256 rows as its last column tile lands. An Iris triggered plan
+(`iris.experimental.plan`), armed on the host a round ahead, has the copy
+engines send each marked strip to its owner's inbox while the projection
+keeps computing. The owner waits per strip and sums its own partial and the
+inbox in rank order, as `iris_pull_reduce_scatter` does, so both transports
+return the same bits for the same partials.
+
+- One plan serves one row window: the row counts whose owned rows fill every
+  strip of the pitch (6145 to 8192 rows at TP8 with an 8192-token prefill
+  chunk). Region sizes are fixed when a plan is made, and plans sharing copy
+  queues must run their rounds in the order they were armed, so other row
+  counts keep the CU path. Whether a batch uses the plan depends only on its
+  row count and graph capture, so every rank decides the same.
+- Each use is one round, stream-ordered with no host synchronization: start,
+  projection, owner reduce, a queued wait that every strip reached its owner
+  (later writers of the producer buffer follow it), and the collective round
+  fence, which frees the inbox for the next round and arms it. Plans are armed
+  from the host, so the transport declines under graph capture.
+- A strip that never arrives sets an error word after a bounded poll instead
+  of hanging. The error state is copied to pinned memory after each round and
+  raised by a later round once the copy has landed, so a failure stops the
+  server rather than wedging it.
+
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
 
 ```python
 from tokenspeed_kernel.ops.communication.iris import configure_iris
 
-configure_iris(heap_size=None, allocator_type="torch")
+configure_iris(heap_size=None, allocator_type="torch", engines=())
 ```
 
 `heap_size=None` sizes the heap automatically. `allocator_type=None` picks
 `vmem_chunked` when the world spans hosts and Iris's `torch` default otherwise.
-Names pass through to Iris; `IRIS_ALLOCATOR` takes precedence. A live context
+Names pass through to Iris; `IRIS_ALLOCATOR` takes precedence. `engines=()`
+opens no copy engines; `("sdma",)` opens the SDMA engines that the triggered
+transport below needs (rocm-xio, every rank on one host). A live context
 cannot be reconfigured.
 
 The heap spans the world. `discover_iris_world()`, called once during
