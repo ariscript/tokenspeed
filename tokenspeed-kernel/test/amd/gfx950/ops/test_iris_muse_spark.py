@@ -3388,9 +3388,13 @@ def _muse_triggered_reduce_scatter_worker(rank, world_size, device):
         if not serves:
             continue
         # Stale or early reads of either buffer would surface as NaN. The CU
-        # reduce-scatter's exit barrier has finished every peer's reads.
+        # reduce-scatter's exit barrier has finished every peer's reads. Peers
+        # may copy into this rank's inbox as soon as every rank has passed the
+        # last round's fence, so every rank poisons before any rank starts.
         producer.fill_(float("nan"))
         trs.inbox.fill_(float("nan"))
+        torch.cuda.synchronize()
+        dist.barrier()
         actual = state.project_reduce_scatter_owned_rows(x, weight)
         assert torch.equal(actual, expected), f"step {step}, {rows} rows"
         served += 1
