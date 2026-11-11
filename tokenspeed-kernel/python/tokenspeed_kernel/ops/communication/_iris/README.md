@@ -102,9 +102,10 @@ owner's rows at a fixed pitch in the producer buffer and marks every strip of
 256 rows as its last column tile lands. An Iris triggered plan
 (`iris.experimental.plan`), armed on the host a round ahead, has the copy
 engines send each marked strip to its owner's inbox while the projection
-keeps computing. The owner waits per strip and sums its own partial and the
-inbox in rank order, as `iris_pull_reduce_scatter` does, so both transports
-return the same bits for the same partials.
+keeps computing. Every peer's copy of strip `s` arrives on the plan's arrival
+group `s`, so the owner waits on one counter per strip, then sums its own
+partial and the inbox in rank order, as `iris_pull_reduce_scatter` does, so both
+transports return the same bits for the same partials.
 
 - One plan serves one row window: the row counts whose owned rows fill every
   strip of the pitch (6145 to 8192 rows at TP8 with an 8192-token prefill
