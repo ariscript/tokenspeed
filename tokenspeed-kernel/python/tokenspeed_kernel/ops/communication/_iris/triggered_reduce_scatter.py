@@ -83,39 +83,35 @@ def iris_triggered_reduce_scatter_rows(
     ``partials`` is ``[WORLD_SIZE * OWNER_PITCH, WIDTH]``: this rank's rows sit
     at ``RANK * OWNER_PITCH``. ``inbox[(q - RANK - 1) % WORLD_SIZE]`` holds rank
     ``q``'s partials of them, delivered strip by strip by ``handle``'s plan.
-    Each strip waits for its chunks from every peer, then the rows are summed
+    Each strip waits for its group, every peer's chunk of it, then the rows are summed
     in FP32 in rank order 0..WORLD_SIZE-1 and rounded to BF16, as
     ``iris_pull_reduce_scatter`` does; rows past ``ROWS`` are written as zero.
     A strip that never arrives sets ``error_word`` instead of hanging.
     """
     STRIPS: gl.constexpr = OWNER_PITCH // STRIP
-    CHUNKS: gl.constexpr = STRIPS * (WORLD_SIZE - 1)
     cv = TriggeredView.initialize(handle)
     pid = gl.program_id(0)
     elements = OWNED_ROWS * WIDTH
     valid = gl.minimum(gl.maximum(ROWS - RANK * OWNED_ROWS, 0), OWNED_ROWS) * WIDTH
     slice_elements: gl.constexpr = OWNER_PITCH * WIDTH
     own = partials + RANK * slice_elements
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    # BLOCK / (64 * NUM_WARPS) consecutive BF16 per lane, 16 bytes per load at 8.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK // (64 * NUM_WARPS)], [64], [NUM_WARPS], [0]
+    )
     lanes = gl.arange(0, BLOCK, layout=layout)
     waited = 0
     for tile in range(pid, gl.cdiv(elements, BLOCK), PROGRAMS):
         # Tiles of a program only move forward, so each strip is waited once.
         need = (tile * BLOCK + BLOCK - 1) // (STRIP * WIDTH) + 1
         while waited < gl.minimum(need, STRIPS):
-            for peer in gl.static_range(WORLD_SIZE):
-                if peer != RANK:
-                    # Peer's chunk for this strip toward this rank
-                    chunk = (
-                        peer * CHUNKS
-                        + waited * (WORLD_SIZE - 1)
-                        + (RANK - peer - 1 + WORLD_SIZE) % WORLD_SIZE
-                    )
-                    polls = 0
-                    while (cv.arrived(chunk) == 0) & (polls < POLL_LIMIT):
-                        polls += 1
-                    if polls >= POLL_LIMIT:
-                        gl.atomic_max(error_word, STRIP_TIMED_OUT, sem="relaxed")
+            # Every peer's chunk of strip `waited` toward this rank is in
+            # group `waited`, so one counter covers all of them.
+            polls = 0
+            while (cv.group_arrived(waited) == 0) & (polls < POLL_LIMIT):
+                polls += 1
+            if polls >= POLL_LIMIT:
+                gl.atomic_max(error_word, STRIP_TIMED_OUT, sem="relaxed")
             waited += 1
         offsets = tile * BLOCK + lanes
         mask = offsets < valid
@@ -206,7 +202,10 @@ class TriggeredOwnedRowsReduceScatter:
                     row_bytes=strip_bytes,
                     dst_offset_bytes=slot * slice_bytes + strip * strip_bytes,
                 )
-                schedule.append(Chunk((region,), writers=1, peers=(owner,)))
+                # Strip s from every peer arrives on group s's counter.
+                schedule.append(
+                    Chunk((region,), writers=1, peers=(owner,), group=strip)
+                )
         self.plan = TriggeredPlan(
             ctx, self.partials, schedule, timeout=timeout, destination=self.inbox
         )
