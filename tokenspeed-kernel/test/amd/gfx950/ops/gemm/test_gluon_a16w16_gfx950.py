@@ -294,8 +294,11 @@ def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
     assert counters.tolist() == expected
 
 
+@pytest.mark.parametrize("plan_strips", [0, 2, 4])
 @pytest.mark.parametrize("m", [6145, 6151, 7000, 7777, 8191, 8192, 1500])
-def test_largem_mark_owner_rows_pitches_rows_and_marks_each_strip_once(m) -> None:
+def test_largem_mark_owner_rows_pitches_rows_and_marks_each_strip_once(
+    m, plan_strips
+) -> None:
     world, rank, pitch, n = 8, 5, 1024, 8192
     torch.manual_seed(m)
     a = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
@@ -303,9 +306,14 @@ def test_largem_mark_owner_rows_pitches_rows_and_marks_each_strip_once(m) -> Non
     full = launch_gluon_mm_a16w16_prefill_gfx950(a, b, torch.bfloat16)
     owned = -(-m // world)
     strips = pitch // 256
+    words = strips * (world - 1)
     out = torch.full((world * pitch, n), 7.0, device="cuda", dtype=torch.bfloat16)
-    counters = torch.full((strips * (world - 1),), -3, device="cuda", dtype=torch.int32)
+    counters = torch.full((words,), -3, device="cuda", dtype=torch.int32)
     arrivals = torch.zeros_like(counters)
+    # Each owner's ready words on its "heap": the GEMM translates this rank's
+    # copy by heap base, so owner q's base at its own row lands there.
+    ready = torch.full((world, words), -3, device="cuda", dtype=torch.int32)
+    heaps = tuple(row.data_ptr() for row in ready)
     for call in (1, 2):
         assert (
             launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
@@ -314,16 +322,31 @@ def test_largem_mark_owner_rows_pitches_rows_and_marks_each_strip_once(m) -> Non
                 out,
                 counters,
                 arrivals,
+                ready[rank],
+                heaps,
                 owned_rows=owned,
                 owner_pitch=pitch,
+                plan_strips=plan_strips,
+                epoch=10 + call,
                 rank=rank,
                 world_size=world,
             )
             is out
         )
         # Every strip of every other owner is marked exactly once per call,
-        # including strips a short last owner leaves empty.
-        assert counters.tolist() == [-3 + call] * counters.numel()
+        # including strips a short last owner leaves empty: the plan's strips
+        # in this rank's counters, the rest in the owner's ready words.
+        plan_words = plan_strips * (world - 1)
+        assert counters.tolist() == [-3 + call] * plan_words + [-3] * (
+            words - plan_words
+        )
+        expected = torch.full_like(ready, -3)
+        for owner in range(world):
+            if owner != rank:
+                slot = (rank - owner - 1) % world
+                for strip in range(plan_strips, strips):
+                    expected[owner, strip * (world - 1) + slot] = 10 + call
+        assert torch.equal(ready, expected)
         assert not arrivals.any()
     for owner in range(world):
         rows = max(0, min(owned, m - owner * owned))
@@ -332,16 +355,31 @@ def test_largem_mark_owner_rows_pitches_rows_and_marks_each_strip_once(m) -> Non
             placed, full[owner * owned : owner * owned + rows], atol=0, rtol=0
         )
         assert torch.all(out[owner * pitch + rows : (owner + 1) * pitch] == 7.0)
-    # A pitch off the strips, a wrong owned-row count, or too few counters
-    # launch nothing.
-    for kwargs, chunks in (
-        (dict(owned_rows=owned, owner_pitch=pitch + 8), counters),
-        (dict(owned_rows=owned + 1, owner_pitch=pitch), counters),
-        (dict(owned_rows=owned, owner_pitch=pitch), counters[:-1]),
-    ):
+    # A pitch off the strips, a wrong owned-row count, more plan strips than
+    # the pitch has, too few counters or ready words, or a heap base per rank
+    # missing launch nothing.
+    for kwargs, chunks, words_, bases in (
+        (dict(owned_rows=owned, owner_pitch=pitch + 8), counters, ready[rank], heaps),
+        (dict(owned_rows=owned + 1, owner_pitch=pitch), counters, ready[rank], heaps),
+        (dict(owned_rows=owned, owner_pitch=pitch, plan_strips=strips + 1), counters, ready[rank], heaps),
+        (dict(owned_rows=owned, owner_pitch=pitch, plan_strips=strips), counters[:-1], ready[rank], heaps),
+        (dict(owned_rows=owned, owner_pitch=pitch), counters, ready[rank, :-1], heaps),
+        (dict(owned_rows=owned, owner_pitch=pitch), counters, ready[rank], heaps[:-1]),
+    ):  # fmt: skip
+        kwargs.setdefault("plan_strips", 2)
         assert (
             launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
-                a, b, out, chunks, arrivals, rank=rank, world_size=world, **kwargs
+                a,
+                b,
+                out,
+                chunks,
+                arrivals,
+                words_,
+                bases,
+                epoch=1,
+                rank=rank,
+                world_size=world,
+                **kwargs,
             )
             is None
         )
@@ -357,8 +395,10 @@ def test_largem_mark_owner_rows_does_not_recompile_across_row_counts() -> None:
     out = torch.empty((world * pitch, n), device="cuda", dtype=torch.bfloat16)
     counters = torch.zeros(4 * (world - 1), device="cuda", dtype=torch.int32)
     arrivals = torch.zeros_like(counters)
+    ready = torch.zeros((world, 4 * (world - 1)), device="cuda", dtype=torch.int32)
+    heaps = tuple(row.data_ptr() for row in ready)
 
-    def launch(m):
+    def launch(m, epoch):
         a = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
         launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
             a,
@@ -366,16 +406,21 @@ def test_largem_mark_owner_rows_does_not_recompile_across_row_counts() -> None:
             out,
             counters,
             arrivals,
+            ready[2],
+            heaps,
             owned_rows=-(-m // world),
             owner_pitch=pitch,
+            plan_strips=2,
+            epoch=epoch,
             rank=2,
             world_size=world,
         )
 
-    launch(8192)
+    launch(8192, 16)
+    # Epochs include 1 and non-multiples of 16, which Triton would specialize.
     with assert_no_triton_compile(gluon_mm_a16w16_prefill_mark_owner_rows_gfx950):
-        for m in (6145, 7001, 7999, 8184):
-            launch(m)
+        for m, epoch in zip((6145, 7001, 7999, 8184), (1, 17, 32, 33)):
+            launch(m, epoch)
     torch.cuda.synchronize()
 
 

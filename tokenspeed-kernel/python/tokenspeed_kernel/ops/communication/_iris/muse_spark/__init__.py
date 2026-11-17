@@ -116,6 +116,19 @@ _MUSE_ATTENTION_OUTPUT_WIDTH = 8192
 _MUSE_TRIGGERED_REDUCE_SCATTER_MIN_ROWS = _MUSE_OWNED_MIN_ROWS
 # How long the SDMA plan's waits and round fence wait before recording an error.
 _MUSE_TRIGGERED_TIMEOUT_SECONDS = 60.0
+
+
+def _muse_triggered_sdma_strips(pitch: int) -> int:
+    """Leading 256-row strips per owner the copy engines send; owners pull the rest.
+
+    Copies of the strips the GEMM finishes first hide behind its remaining
+    work; the last strips finish with it, and the CU pull moves them faster.
+    At TP8 with 4 strips, sending 2 was fastest from 6145 to 8192 rows on
+    MI350X and MI355X, and sending 1, 3 or all 4 was slower.
+    """
+    return (pitch // 256 + 1) // 2
+
+
 _MUSE_ROW_GATHER_PROGRAMS = 128
 _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
@@ -222,10 +235,17 @@ class MuseIrisState:
             max_numel, world_size, attention_reduce_scatter_transport
         )
         if pitch:
-            # The peers' strips land in an inbox; the plan's gates fit the headroom.
+            # The peers' copied strips land in an inbox, and their GEMMs mark
+            # the pulled ones in ready words; the plan's gates fit the headroom.
             size += allocation_bytes(
-                (world_size - 1, pitch, _MUSE_BOUNDARY_WIDTH), torch.bfloat16
+                (
+                    world_size - 1,
+                    _muse_triggered_sdma_strips(pitch) * 256,
+                    _MUSE_BOUNDARY_WIDTH,
+                ),
+                torch.bfloat16,
             )
+            size += allocation_bytes((world_size - 1, pitch // 256), torch.int32)
         return size
 
     @staticmethod
@@ -552,6 +572,7 @@ class MuseIrisState:
                 all_reduce.producer.data,
                 owner_pitch=pitch,
                 width=_MUSE_BOUNDARY_WIDTH,
+                sdma_strips=_muse_triggered_sdma_strips(pitch),
                 min_rows=_MUSE_TRIGGERED_REDUCE_SCATTER_MIN_ROWS,
                 timeout=_MUSE_TRIGGERED_TIMEOUT_SECONDS,
             )
@@ -747,7 +768,12 @@ class MuseIrisState:
         return trs.run(x, weight, output)
 
     def warmup_triggered_reduce_scatter(self) -> None:
-        """Run and check one SDMA round before serving, compiling its kernels."""
+        """Run and check one SDMA round before serving, compiling its kernels.
+
+        Startup's warmup prefill fills a whole chunk, which the SDMA plan
+        serves, so this also runs the CU pull once at the attention output's
+        width: it serves every other owned-row count.
+        """
         trs = self.triggered_reduce_scatter
         if trs is None:
             return
@@ -760,7 +786,15 @@ class MuseIrisState:
         weight = torch.zeros(
             (trs.width, x.shape[1]), dtype=torch.bfloat16, device=device
         )
-        trs.warmup(x, weight)
+        # Into the storage project_reduce_scatter_owned_rows returns.
+        output = self.all_reduce.producer_pull.scratch[
+            : triton.cdiv(trs.max_rows, self.world_size) * trs.width
+        ].view(-1, trs.width)
+        trs.warmup(x, weight, output)
+        rows = trs.min_rows - 1
+        self.reduce_scatter_owned_rows(
+            self.all_reduce.producer.data[: rows * trs.width].view(rows, trs.width)
+        )
 
     def close(self) -> None:
         """Collective: release the SDMA plan, raising any error it recorded."""

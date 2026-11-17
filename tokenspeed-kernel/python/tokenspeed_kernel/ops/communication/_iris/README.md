@@ -96,16 +96,21 @@ and sums all columns.
 ## SDMA transport
 
 `triggered_reduce_scatter.py` runs Muse's owned-row attention projection and
-reduce-scatter on the SDMA copy engines (`--iris-transport sdma`; the heap is
-configured with `engines=("sdma",)`). The output projection writes each
-owner's rows at a fixed pitch in the producer buffer and marks every strip of
-256 rows as its last column tile lands. An Iris triggered plan
+reduce-scatter partly on the SDMA copy engines (`--iris-transport sdma`; the
+heap is configured with `engines=("sdma",)`). The output projection writes
+each owner's rows at a fixed pitch in the producer buffer and marks every
+strip of 256 rows as its last column tile lands. An Iris triggered plan
 (`iris.experimental.plan`), armed on the host a round ahead, has the copy
-engines send each marked strip to its owner's inbox while the projection
-keeps computing. Every peer's copy of strip `s` arrives on the plan's arrival
-group `s`, so the owner waits on one counter per strip, then sums its own
-partial and the inbox in rank order, as `iris_pull_reduce_scatter` does, so both
-transports return the same bits for the same partials.
+engines send each owner's first strips to its inbox while the projection
+keeps computing. The projection finishes the last strips as it ends, when no
+compute is left to hide copies behind, and one copy engine per GPU pair moves
+data slower than the CU pull, so the projection marks those strips in the
+owner's ready words instead and the owner reads them from the peers'
+producer buffers. Every peer's copy of strip `s` arrives on the plan's
+arrival group `s`, so the owner waits on one counter per copied strip. A few
+of the owner's workgroups pull while the others reduce copied strips; both
+sum in rank order, as `iris_pull_reduce_scatter` does, so both transports
+return the same bits for the same partials.
 
 - One plan serves one row window: the row counts whose owned rows fill every
   strip of the pitch (6145 to 8192 rows at TP8 with an 8192-token prefill
@@ -114,10 +119,13 @@ transports return the same bits for the same partials.
   counts keep the CU path. Whether a batch uses the plan depends only on its
   row count and graph capture, so every rank decides the same.
 - Each use is one round, stream-ordered with no host synchronization: start,
-  projection, owner reduce, a queued wait that every strip reached its owner
-  (later writers of the producer buffer follow it), and the collective round
-  fence, which frees the inbox for the next round and arms it. Plans are armed
-  from the host, so the transport declines under graph capture.
+  projection, owner reduce, a queued wait that every copied strip reached its
+  owner (later writers of the producer buffer follow it), and the collective
+  round fence, which frees the inbox for the next round and arms it. The fence
+  also follows every rank's pulls, so no peer's next projection overwrites
+  partials an owner is still reading; ready words hold the plan's round, so
+  they need no reset. Plans are armed from the host, so the transport
+  declines under graph capture.
 - A strip that never arrives sets an error word after a bounded poll instead
   of hanging. The error state is copied to pinned memory after each round and
   raised by a later round once the copy has landed, so a failure stops the

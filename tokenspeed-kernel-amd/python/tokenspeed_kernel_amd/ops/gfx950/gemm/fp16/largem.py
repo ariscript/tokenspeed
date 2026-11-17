@@ -721,10 +721,11 @@ def gluon_mm_a16w16_prefill_publish_rows_gfx950(
             )
 
 
-# M and the owned-row count follow the token count and stay runtime arguments.
+# M and the owned-row count follow the token count, and the epoch advances
+# every launch; all stay runtime arguments.
 @gluon.jit(
     launch_metadata=_dense16_mm_launch_metadata,
-    do_not_specialize=("M", "OWNED_ROWS"),
+    do_not_specialize=("M", "OWNED_ROWS", "EPOCH"),
 )
 def gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
     a_ptr,
@@ -732,6 +733,15 @@ def gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
     c_ptr,
     counters,
     strip_arrivals,
+    ready,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
     M,
     N,
     K,
@@ -741,6 +751,8 @@ def gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
     stride_bn,
     stride_cm,
     OWNED_ROWS,
+    EPOCH,
+    PLAN_STRIPS: gl.constexpr,
     OWNER_PITCH: gl.constexpr,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
@@ -759,12 +771,17 @@ def gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
     place whatever ``M`` is. Workgroups take strip ``s`` of every owner,
     this rank's own last, before strip ``s + 1``.
 
-    Strip ``s`` of the ``j``-th following owner is chunk ``s * (WORLD_SIZE -
-    1) + j`` of this rank's triggered plan. Each of its column tiles stores
-    write-through and counts itself in ``strip_arrivals``; the last one resets
-    that count and adds 1 to ``counters[chunk]``, so a chunk has a single
-    writer however many column tiles it has. Own strips are not marked. Every
-    tile does the full GEMM's work for its rows, so the bits match.
+    Each column tile of strip ``s`` of the ``j``-th following owner stores
+    write-through and counts itself in ``strip_arrivals[s * (WORLD_SIZE - 1) +
+    j]``; the last one resets that count and marks the strip once, however
+    many column tiles it has. Strips below ``PLAN_STRIPS`` are chunk ``s *
+    (WORLD_SIZE - 1) + j`` of this rank's triggered plan and add 1 to that
+    entry of ``counters``. Later strips are pulled by their owner, so the mark
+    stores ``EPOCH`` into the owner's ``ready[s * (WORLD_SIZE - 1) + slot]``
+    on its heap (``heap_base_q``; ``ready`` is this rank's symmetric copy),
+    where ``slot`` is ``(RANK - owner - 1) % WORLD_SIZE``. Own strips are not
+    marked. Every tile does the full GEMM's work for its rows, so the bits
+    match.
     """
     pid = gl.program_id(0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
@@ -834,7 +851,30 @@ def gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
         seen = gl.atomic_add(strip_arrivals + chunk, 1, sem="acq_rel", scope="sys")
         if seen == num_pid_n - 1:
             gl.atomic_xchg(strip_arrivals + chunk, 0, sem="relaxed", scope="gpu")
-            gl.atomic_add(counters + chunk, 1, sem="release", scope="sys")
+            if strip < PLAN_STRIPS:
+                gl.atomic_add(counters + chunk, 1, sem="release", scope="sys")
+            else:
+                heaps = (
+                    heap_base_0,
+                    heap_base_1,
+                    heap_base_2,
+                    heap_base_3,
+                    heap_base_4,
+                    heap_base_5,
+                    heap_base_6,
+                    heap_base_7,
+                )
+                slot = (RANK - owner - 1 + WORLD_SIZE) % WORLD_SIZE
+                word = strip * (WORLD_SIZE - 1) + slot
+                offset = ready.to(gl.uint64) - heaps[RANK]
+                for peer in gl.static_range(WORLD_SIZE):
+                    if owner == peer:
+                        gl.atomic_xchg(
+                            (heaps[peer] + offset).to(gl.pointer_type(gl.int32)) + word,
+                            EPOCH,
+                            sem="release",
+                            scope="sys",
+                        )
 
 
 @gluon.jit
@@ -1116,9 +1156,13 @@ def launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
     out: torch.Tensor,
     counters: torch.Tensor,
     strip_arrivals: torch.Tensor,
+    ready: torch.Tensor,
+    heap_bases: tuple[int, ...],
     *,
     owned_rows: int,
     owner_pitch: int,
+    plan_strips: int,
+    epoch: int,
     rank: int,
     world_size: int,
 ) -> torch.Tensor | None:
@@ -1127,23 +1171,31 @@ def launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
     Owner ``q``'s rows ``[q * owned_rows, (q + 1) * owned_rows)`` of ``A`` land
     at rows ``[q * owner_pitch, ...)`` of ``out`` (``[world_size * owner_pitch,
     N]``), in strips of ``LARGEM_BLOCK_M`` rows. Strip ``s`` of the ``j``-th
-    owner after ``rank`` marks ``counters[s * (world_size - 1) + j]`` once, when
-    its last column tile is stored; ``strip_arrivals`` (int32, one per chunk,
-    zero between launches) counts the column tiles. Returns None (launching
-    nothing) for unsupported operands.
+    owner after ``rank`` is marked once, when its last column tile is stored:
+    strips below ``plan_strips`` add 1 to ``counters[s * (world_size - 1) +
+    j]``; later strips store ``epoch`` into ``ready[s * (world_size - 1) +
+    (rank - q - 1) % world_size]`` on owner ``q``'s heap. Returns None
+    (launching nothing) for unsupported operands.
 
     Args:
         A: Activations ``[M, K]``.
         B: Weight ``[N, K]``.
         out: Destination ``[world_size * owner_pitch, N]``, contiguous rows.
-        counters: This rank's triggered-plan counters, one int32 per chunk.
-        strip_arrivals: Scratch int32 per chunk, zero before the launch and
-            left zero after it.
+        counters: This rank's triggered-plan counters, one int32 per chunk of
+            the first ``plan_strips`` strips.
+        strip_arrivals: Scratch int32, one per strip of every other owner,
+            zero before the launch and left zero after it.
+        ready: This rank's symmetric int32 ready words, one per strip of every
+            other owner.
+        heap_bases: Every rank's symmetric heap base, ``world_size`` entries.
         owned_rows: Rows per owner, ``ceil(M / world_size)``.
         owner_pitch: Rows reserved per owner in ``out``, a multiple of
             ``LARGEM_BLOCK_M`` of at least ``owned_rows``.
+        plan_strips: Leading strips per owner marked in ``counters``; the rest
+            are marked in their owner's ``ready``.
+        epoch: Value the ready words receive, new for every launch.
         rank: This rank.
-        world_size: Number of owners.
+        world_size: Number of owners, at most 8.
 
     Returns:
         ``out``, or None when the operands are unsupported.
@@ -1155,25 +1207,28 @@ def launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
         or B.dtype != A.dtype
         or not A.is_cuda
         or not B.is_cuda
-        or not 0 <= rank < world_size
+        or not 0 <= rank < world_size <= 8
+        or len(heap_bases) != world_size
         or owner_pitch % LARGEM_BLOCK_M
-        or counters.dtype != torch.int32
-        or strip_arrivals.dtype != torch.int32
-        or counters.device != A.device
-        or strip_arrivals.device != A.device
+        or any(
+            t.dtype != torch.int32 or t.device != A.device
+            for t in (counters, strip_arrivals, ready)
+        )
     ):
         return None
     M, K = A.shape
     N, K_b = B.shape
     strips = owner_pitch // LARGEM_BLOCK_M
-    chunks = strips * (world_size - 1)
+    words = strips * (world_size - 1)
     if (
         K_b != K
         or not _supports_largem_shape(M, N, K)
         or owned_rows != triton.cdiv(M, world_size)
         or not 0 < owned_rows <= owner_pitch
-        or counters.numel() < chunks
-        or strip_arrivals.numel() < chunks
+        or not 0 <= plan_strips <= strips
+        or counters.numel() < plan_strips * (world_size - 1)
+        or strip_arrivals.numel() < words
+        or ready.numel() < words
     ):
         return None
     C = _resolve_largem_output(A, world_size * owner_pitch, N, A.dtype, out)
@@ -1186,6 +1241,9 @@ def launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
         C,
         counters,
         strip_arrivals,
+        ready,
+        *heap_bases,
+        *(0,) * (8 - world_size),
         M,
         N,
         K,
@@ -1195,6 +1253,8 @@ def launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950(
         B.stride(0),
         C.stride(0),
         owned_rows,
+        epoch,
+        PLAN_STRIPS=plan_strips,
         OWNER_PITCH=owner_pitch,
         RANK=rank,
         WORLD_SIZE=world_size,

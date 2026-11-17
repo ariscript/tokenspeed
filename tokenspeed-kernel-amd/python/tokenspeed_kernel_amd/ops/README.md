@@ -120,15 +120,17 @@ Qwen3.8-Flash-Next decode batches.
   equals the replicated GEMM's bitwise.
 - `launch_gluon_mm_a16w16_prefill_mark_owner_rows_gfx950` runs the prefill
   tile for a reduce-scatter over consecutive owner rows (`ceil(M / world)`
-  each) and hands each strip of 256 rows to the SDMA copy engines. It stores
-  owner `q`'s rows at row `q * owner_pitch` of the output, so every strip has
-  a fixed place for any `M`, and takes strip `s` of every owner (its own last)
-  before strip `s + 1`. Each column tile of another owner's strip stores
+  each) and marks each strip of 256 rows for its owner. It stores owner `q`'s
+  rows at row `q * owner_pitch` of the output, so every strip has a fixed
+  place for any `M`, and takes strip `s` of every owner (its own last) before
+  strip `s + 1`. Each column tile of another owner's strip stores
   write-through and counts itself on a scratch counter with a system-scope
   release, which writes back its XCD's L2; the last tile resets that counter
-  and adds 1 to the strip's triggered-plan counter. A strip past a short last
-  owner stores nothing but is still counted. Rows carry the prefill kernel's
-  bits.
+  and marks the strip: the first `plan_strips` strips add 1 to their
+  triggered-plan counter, so the SDMA copy engines send them, and later
+  strips store the launch's epoch into the owner's ready word on its
+  symmetric heap, so the owner pulls them. A strip past a short last owner
+  stores nothing but is still marked. Rows carry the prefill kernel's bits.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.

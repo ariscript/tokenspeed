@@ -3345,15 +3345,26 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
 
 
 def _muse_triggered_reduce_scatter_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris import get_or_create_context
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
     )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+    from tokenspeed_kernel.ops.communication._iris.triggered_reduce_scatter import (
+        TriggeredOwnedRowsReduceScatter,
+        iris_triggered_reduce_scatter_rows,
+    )
     from tokenspeed_kernel.ops.communication.iris import configure_iris
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        gluon_mm_a16w16_prefill_mark_owner_rows_gfx950,
         launch_gluon_mm_a16w16_prefill_gfx950,
     )
+    from utils import assert_no_triton_compile
 
-    configure_iris(heap_size=None, allocator_type=None, engines=("sdma",))
+    # Room for the other splits' inboxes after Muse's own.
+    configure_iris(heap_size=2 << 30, allocator_type=None, engines=("sdma",))
     state = prepare_muse_communication(
         group=dist.group.WORLD,
         rank_in_group=rank,
@@ -3367,48 +3378,89 @@ def _muse_triggered_reduce_scatter_worker(rank, world_size, device):
         device=device,
     )
     trs = state.triggered_reduce_scatter
-    assert (trs.owner_pitch, trs.strips) == (8192 // world_size, 4)
+    assert (trs.owner_pitch, trs.strips, trs.sdma_strips) == (8192 // world_size, 4, 2)
     state.warmup_triggered_reduce_scatter()
-    first_round = trs.plan.round
     generator = torch.Generator(device=device).manual_seed(rank)
     weight = (torch.randn((8192, 1024), generator=generator, device=device) / 32).to(
         torch.bfloat16
     )
     producer = state.all_reduce.producer.data
-    served = 0
+
+    def check_rounds(trs, project, row_counts):
+        first_round = trs.plan.round
+        served = 0
+        for step, rows in enumerate(row_counts):
+            x = torch.randn((rows, 1024), generator=generator, device=device).to(
+                torch.bfloat16
+            )
+            partial = producer[: rows * 8192].view(rows, 8192)
+            assert (
+                launch_gluon_mm_a16w16_prefill_gfx950(
+                    x, weight, torch.bfloat16, out=partial
+                )
+                is not None
+            )
+            expected = state.reduce_scatter_owned_rows(partial).clone()
+            serves = trs.serves(rows)
+            assert serves == (rows > 6144)
+            if not serves:
+                continue
+            # Stale or early reads of the inbox or of a peer's partials would
+            # surface as NaN. The CU reduce-scatter's exit barrier has finished
+            # every peer's reads. Peers may copy into this rank's inbox as soon
+            # as every rank has passed the last round's fence, so every rank
+            # poisons before any rank starts.
+            producer.fill_(float("nan"))
+            trs.inbox.fill_(float("nan"))
+            torch.cuda.synchronize()
+            dist.barrier()
+            actual = project(x)
+            assert torch.equal(actual, expected), f"step {step}, {rows} rows"
+            served += 1
+        torch.cuda.synchronize()
+        trs.raise_recorded_errors()
+        assert trs.plan.round == first_round + served
+
     # Rows the plan serves (more than 6144) interleaved with rows it leaves to
     # the CU path, for more rounds than the plan has strips.
-    for step, rows in enumerate((8192, 6145, 4096, 7001, 6144, 8191, 7777) * 10):
-        x = torch.randn((rows, 1024), generator=generator, device=device).to(
-            torch.bfloat16
+    rows = (8192, 6145, 4096, 7001, 6144, 8191, 7777)
+    assert state.projects_reduce_scatter(8192)
+    # The warmup compiled both paths, the CU pull included: startup's warmup
+    # prefill fills a chunk, which the plan serves.
+    with assert_no_triton_compile(
+        iris_pull_reduce_scatter,
+        iris_triggered_reduce_scatter_rows,
+        gluon_mm_a16w16_prefill_mark_owner_rows_gfx950,
+    ):
+        check_rounds(
+            trs,
+            lambda x: state.project_reduce_scatter_owned_rows(x, weight),
+            rows * 10,
         )
-        partial = producer[: rows * 8192].view(rows, 8192)
-        assert (
-            launch_gluon_mm_a16w16_prefill_gfx950(
-                x, weight, torch.bfloat16, out=partial
-            )
-            is not None
-        )
-        expected = state.reduce_scatter_owned_rows(partial).clone()
-        serves = state.projects_reduce_scatter(rows)
-        assert serves == (rows > 6144)
-        if not serves:
-            continue
-        # Stale or early reads of either buffer would surface as NaN. The CU
-        # reduce-scatter's exit barrier has finished every peer's reads. Peers
-        # may copy into this rank's inbox as soon as every rank has passed the
-        # last round's fence, so every rank poisons before any rank starts.
-        producer.fill_(float("nan"))
-        trs.inbox.fill_(float("nan"))
-        torch.cuda.synchronize()
-        dist.barrier()
-        actual = state.project_reduce_scatter_owned_rows(x, weight)
-        assert torch.equal(actual, expected), f"step {step}, {rows} rows"
-        served += 1
-    torch.cuda.synchronize()
-    trs.raise_recorded_errors()
-    assert trs.plan.round == first_round + served
     state.close()
+    # One strip on the copy engines, and every strip, so nothing is pulled.
+    ctx = get_or_create_context(heap_size=2 << 30)
+    for sdma_strips in (1, 4):
+        trs = TriggeredOwnedRowsReduceScatter(
+            ctx,
+            producer,
+            owner_pitch=8192 // world_size,
+            width=8192,
+            sdma_strips=sdma_strips,
+            min_rows=1,
+            timeout=60.0,
+        )
+
+        def project(x, trs=trs):
+            output = torch.empty(
+                (-(-x.shape[0] // world_size), 8192),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            return trs.run(x, weight, output)
+
+        check_rounds(trs, project, rows * 3)
+        trs.close()
 
 
 @pytest.mark.parametrize("world_size", [8])
