@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 
 
-@gluon.jit(do_not_specialize=["rows"])
+@gluon.jit(do_not_specialize=["rows", "row_start"])
 def iris_pull_allgather_sorted_mxfp4_slices(
     slice_data,
     slice_scales,
@@ -45,6 +45,7 @@ def iris_pull_allgather_sorted_mxfp4_slices(
     ready_flags,
     heaps,
     rows,
+    row_start,
     RANK: gl.constexpr,
     SLICE_WORDS: gl.constexpr,
     PANEL_WORDS: gl.constexpr,
@@ -62,8 +63,10 @@ def iris_pull_allgather_sorted_mxfp4_slices(
     layout because the scale swizzle keeps each 8-column K block contiguous in
     a panel. Every rank must have sorted the same top-k IDs deterministically.
     Rows past num_valid_ids[0] and padding routes (token field >= rows) are not
-    copied. ready_flags publish the producer's write-back stores and hold the
-    slices until every peer has read them.
+    copied. Below row_start (a multiple of 32) only this rank's own slice is
+    copied: the SDMA transport delivers the peers' slices of those rows.
+    ready_flags publish the producer's write-back stores and hold the slices
+    until every peer has read them.
     """
     WORLD_SIZE: gl.constexpr = len(heaps)
     program = gl.program_id(0)
@@ -81,9 +84,40 @@ def iris_pull_allgather_sorted_mxfp4_slices(
     valid_rows = gl.load(num_valid_ids)
     layout: gl.constexpr = gl.BlockedLayout([4], [64], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK, layout=layout)
-    words = valid_rows * SLICE_WORDS
-    for tile in range(program, gl.cdiv(words, BLOCK), gl.num_programs(0)):
+    # This rank's own slice of the rows below row_start.
+    own_words = gl.minimum(row_start, valid_rows) * SLICE_WORDS
+    for tile in range(program, gl.cdiv(own_words, BLOCK), gl.num_programs(0)):
         offsets = tile * BLOCK + lanes
+        row = offsets // SLICE_WORDS
+        inside = offsets < own_words
+        token = gl.load(sorted_ids + row, mask=inside, other=0) & 0xFFFFFF
+        mask = inside & (token < rows)
+        destination = row * (WORLD_SIZE * SLICE_WORDS) + offsets % SLICE_WORDS
+        gl.amd.cdna4.buffer_store(
+            gl.amd.cdna4.buffer_load(slice_data, offsets, mask, 0),
+            output,
+            destination + RANK * SLICE_WORDS,
+            mask,
+        )
+    own_scale_words = gl.cdiv(gl.minimum(row_start, valid_rows), 32) * PANEL_WORDS
+    for tile in range(program, gl.cdiv(own_scale_words, BLOCK), gl.num_programs(0)):
+        offsets = tile * BLOCK + lanes
+        mask = offsets < own_scale_words
+        destination = (offsets // PANEL_WORDS) * (
+            WORLD_SIZE * PANEL_WORDS
+        ) + offsets % PANEL_WORDS
+        gl.amd.cdna4.buffer_store(
+            gl.amd.cdna4.buffer_load(slice_scales, offsets, mask, 0),
+            output_scales,
+            destination + RANK * PANEL_WORDS,
+            mask,
+        )
+    first = row_start * SLICE_WORDS
+    words = valid_rows * SLICE_WORDS
+    for tile in range(
+        program, gl.cdiv(gl.maximum(words - first, 0), BLOCK), gl.num_programs(0)
+    ):
+        offsets = first + tile * BLOCK + lanes
         row = offsets // SLICE_WORDS
         inside = offsets < words
         token = gl.load(sorted_ids + row, mask=inside, other=0) & 0xFFFFFF
@@ -108,9 +142,14 @@ def iris_pull_allgather_sorted_mxfp4_slices(
                 destination + ((RANK + step) % WORLD_SIZE) * SLICE_WORDS,
                 mask,
             )
+    first_scale = row_start // 32 * PANEL_WORDS
     scale_words = gl.cdiv(valid_rows, 32) * PANEL_WORDS
-    for tile in range(program, gl.cdiv(scale_words, BLOCK), gl.num_programs(0)):
-        offsets = tile * BLOCK + lanes
+    for tile in range(
+        program,
+        gl.cdiv(gl.maximum(scale_words - first_scale, 0), BLOCK),
+        gl.num_programs(0),
+    ):
+        offsets = first_scale + tile * BLOCK + lanes
         mask = offsets < scale_words
         destination = (offsets // PANEL_WORDS) * (
             WORLD_SIZE * PANEL_WORDS

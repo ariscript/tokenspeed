@@ -131,6 +131,26 @@ return the same bits for the same partials.
   raised by a later round once the copy has landed, so a failure stops the
   server rather than wedging it.
 
+The expert-intermediate gather of the same batches (Muse expert TP8 with the
+output-column-split down copy) uses a second plan, in
+`muse_spark/triggered_gather.py`. The gate/up GEMM runs as consecutive
+sorted-row ranges (`moe_sorted_routes`); after each range below a fixed split
+(49,152 rows, in 16,384-row ranges), a mark from every XCD releases that chunk,
+and the copy engines write this rank's slice of those rows into every peer's
+gathered rows while later ranges compute. The CU gather
+(`iris_pull_allgather_sorted_mxfp4_slices` from `row_start`) moves the
+remaining valid rows and this rank's own slice, and a wait on the plan's
+arrival groups, from every XCD, precedes the down projection. The slice rows
+and their scale panels share one symmetric buffer, as do the gathered rows and
+panels, so each plan has one source and one destination.
+
+The two plans share the copy queues, whose rounds must start in the order they
+were prepared, and each fence prepares its plan's next round at once. So the
+gather uses exactly the attention plan's row window, a served batch runs one
+round of each per layer, alternating, and layers whose experts do not run the
+gather (BF16 experts a checkpoint left unquantized) keep their attention
+reduce-scatter on the CU path. Iris raises if that order ever breaks.
+
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
 

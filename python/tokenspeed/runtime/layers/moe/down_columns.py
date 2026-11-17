@@ -123,7 +123,8 @@ class MoEDownColumns(nn.Module):
         Args:
             intermediate: Sorted MXFP4 rows over the full intermediate.
             intermediate_scale: Their block scales.
-            routes: The sorted-route handle from ``moe_sorted_gate_up``.
+            routes: The sorted-route handle from ``moe_sorted_gate_up`` (or
+                ``moe_sorted_routes(...).routes``).
             output: BF16 ``[tokens * top_k, H / P]`` destination.
 
         Returns:

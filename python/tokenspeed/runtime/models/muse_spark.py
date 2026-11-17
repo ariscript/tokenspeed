@@ -52,7 +52,7 @@ from tokenspeed_kernel.ops.moe import (
     PreparedNvfp4Routing,
     gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
-    moe_sorted_gate_up,
+    moe_sorted_routes,
     moe_topk,
     moe_warmup,
     prepare_nvfp4_routing,
@@ -934,6 +934,11 @@ class MuseSparkAttention(nn.Module):
             qk_norm=(self.q_norm, self.k_norm),
         )
         self.iris_state: MuseIrisState | None = None
+        # Whether owned-row batches the SDMA attention plan serves take it.
+        # With the expert-intermediate gather's plan also prepared, the two
+        # plans share copy queues and must alternate rounds, so only layers
+        # whose experts run that gather do (prepare_communication_runtime).
+        self.reduce_scatter_on_sdma = False
 
     def _projects_into_producer(self, x: torch.Tensor) -> bool:
         """Whether the projection is a plain BF16 GEMM whose TP sum is deferred."""
@@ -969,8 +974,10 @@ class MuseSparkAttention(nn.Module):
         The SDMA transport runs both as one operation for the row counts it
         serves; otherwise the projection's partial goes to the CU reduce-scatter.
         """
-        if self._projects_into_producer(output) and iris.projects_reduce_scatter(
-            output.shape[0]
+        if (
+            self.reduce_scatter_on_sdma
+            and self._projects_into_producer(output)
+            and iris.projects_reduce_scatter(output.shape[0])
         ):
             return iris.project_reduce_scatter_owned_rows(output, self.o_proj.weight)
         return iris.reduce_scatter_owned_rows(self._project(output)[0])
@@ -1780,7 +1787,7 @@ class MuseSparkMoE(nn.Module):
         iris = self.iris_state
         rows = topk_ids.shape[0]
         intermediate, intermediate_scale = iris.acquire_expert_intermediate(rows)
-        routes = moe_sorted_gate_up(
+        staged = moe_sorted_routes(
             compressed,
             topk_weights,
             topk_ids,
@@ -1788,15 +1795,18 @@ class MuseSparkMoE(nn.Module):
             intermediate,
             intermediate_scale,
         )
-        intermediate, intermediate_scale = iris.gather_expert_intermediate(routes, rows)
-        columns = self.down_columns(
-            intermediate,
-            intermediate_scale,
-            routes,
-            torch.empty(
-                (rows * self.topk, self.down_columns.width),
-                dtype=torch.bfloat16,
-                device=topk_ids.device,
+        columns = iris.gate_up_gather_project(
+            staged,
+            rows,
+            lambda gathered, gathered_scale: self.down_columns(
+                gathered,
+                gathered_scale,
+                staged.routes,
+                torch.empty(
+                    (rows * self.topk, self.down_columns.width),
+                    dtype=torch.bfloat16,
+                    device=topk_ids.device,
+                ),
             ),
         )
         norm = self.post_expert_norm
@@ -3327,6 +3337,12 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state
+            # Layers with BF16 experts (a checkpoint may leave the first and
+            # last unquantized) never run the gather's plan, so they keep the
+            # attention reduce-scatter on the CU path while that plan exists.
+            layer.self_attn.reduce_scatter_on_sdma = state.triggered_gather is None or (
+                layer.mlp.quantized_experts and layer.mlp.down_columns is not None
+            )
             layer.self_attn.qkv_proj.iris_state = state
             layer.mlp.iris_state = state
             for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):

@@ -1161,6 +1161,8 @@ def _muse_sdma_attention_reduce_scatter_worker(rank, world_size, device):
     torch.nn.Module.__init__(attention)
     attention.o_proj = o_proj
     attention.iris_state = state
+    # As prepare_communication_runtime sets it without the gather's plan.
+    attention.reduce_scatter_on_sdma = True
     for rows in (8192, 7001, 4096, 6145):
         x = torch.randn(rows, 8192 // world_size, device=device)
         expected = state.reduce_scatter_owned_rows(attention._project(x)[0]).clone()
@@ -1170,6 +1172,16 @@ def _muse_sdma_attention_reduce_scatter_worker(rank, world_size, device):
         assert trs.plan.round == before + served
         torch.testing.assert_close(actual, expected, atol=2**-6, rtol=2**-6)
         dist.barrier()
+    # A layer kept off the plan (its experts do not run the SDMA gather)
+    # reduce-scatters a served row count on the CU path.
+    attention.reduce_scatter_on_sdma = False
+    x = torch.randn(8192, 8192 // world_size, device=device)
+    expected = state.reduce_scatter_owned_rows(attention._project(x)[0]).clone()
+    before = trs.plan.round
+    torch.testing.assert_close(
+        attention._project_reduce_scatter(x, state), expected, atol=0, rtol=0
+    )
+    assert trs.plan.round == before
     torch.cuda.synchronize()
     trs.raise_recorded_errors()
 

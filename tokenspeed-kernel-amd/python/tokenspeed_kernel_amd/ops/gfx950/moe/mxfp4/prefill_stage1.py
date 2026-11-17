@@ -76,6 +76,8 @@ in for indexing only; the C-side is ``I_r``.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
@@ -936,6 +938,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     sorted_token_ids_ptr,
     sorted_expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    ROW_START,
     N,
     K,
     EM,
@@ -985,6 +988,13 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     The epilogue splits interleaved accumulators into gate/up pairs, applies
     the activation, and stores the resulting output tile in ``[EM, I_r]``.
+
+    The per-row operands may start at sorted row ``ROW_START`` (a multiple of
+    ``BLOCK_M``) of a longer sort: ``num_tokens_post_padded_ptr`` holds the
+    whole sort's padded extent, of which ``[ROW_START, ROW_START + EM)`` is
+    this launch's share, and ``sorted_expert_ids_ptr`` the whole sort's tile
+    experts (a pointer advanced by a few tiles would lose its 16-byte
+    alignment and compile another specialization).
     """
 
     gl.static_assert(
@@ -1020,8 +1030,12 @@ def gluon_mxfp4_moe_stage1_kernel(
     # layouts issue gate and up MFMAs for the same output tile.
     num_pid_n = gl.cdiv(I_r, OUTPUT_BLOCK_N)
     # Keep an expert's tiles on one XCD for L2 reuse; only tiles with routes are spread.
+    # Padded rows of this launch's share of the sort.
+    num_tokens_post_padded = gl.minimum(
+        gl.maximum(gl.load(num_tokens_post_padded_ptr) - ROW_START, 0), EM
+    )
     if NUM_XCDS != 1:
-        valid_pid_m = gl.cdiv(gl.load(num_tokens_post_padded_ptr), BLOCK_M)
+        valid_pid_m = gl.cdiv(num_tokens_post_padded, BLOCK_M)
         grid_mn = gl.minimum(valid_pid_m, num_pid_m) * num_pid_n
         if pid < grid_mn:
             pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
@@ -1043,7 +1057,6 @@ def gluon_mxfp4_moe_stage1_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_M >= num_tokens_post_padded:
         return
 
@@ -1232,7 +1245,7 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     # The valid-count guard above excludes every unwritten tail block, so the
     # sort contract guarantees a valid expert for each program reaching here.
-    off_experts = gl.load(sorted_expert_ids_ptr + pid_m)
+    off_experts = gl.load(sorted_expert_ids_ptr + ROW_START // BLOCK_M + pid_m)
 
     # ---- A data-load offsets (consumed by per-tile prefetch) ----------
     offs_ak = gl.arange(0, BLOCK_K_A, layout=k_layout)
@@ -2459,7 +2472,7 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
 
 
-def invoke_gluon_mxfp4_moe_stage1(
+def prepare_gluon_mxfp4_moe_stage1(
     hidden_states,
     w1,
     w2,
@@ -2494,8 +2507,14 @@ def invoke_gluon_mxfp4_moe_stage1(
     source_tokens: int | None = None,
     *,
     num_warps: int,
-):
-    """Host-side launcher for Gluon MXFP4 MoE stage 1.
+) -> Callable[[int, int], None]:
+    """Validate a Gluon MXFP4 MoE stage 1 once and return its launcher.
+
+    ``launch(start, end)`` computes sorted rows ``[start, end)`` on the
+    current stream: ``(0, len(sorted_token_ids))`` for all of them. A partial
+    range needs 2-D sorted output; it starts on a multiple of ``block_m`` and
+    of 32 (a scale panel) and ends on a multiple of ``block_m`` or at the end.
+    Launches over consecutive ranges write the same bits as one launch.
 
     ``num_warps`` explicitly selects the stage's subgroup geometry.
 
@@ -2723,10 +2742,8 @@ def invoke_gluon_mxfp4_moe_stage1(
     BLOCK_K = 256
     GROUP_SIZE_M = 1
     NUM_WARPS = num_warps
-    num_pid_m = triton.cdiv(EM, BLOCK_M)
     output_block_n = BLOCK_N // 2 if b_gdot128 else BLOCK_N
     num_pid_n = triton.cdiv(I_r, output_block_n)
-    grid = (num_pid_m * num_pid_n,)
 
     # Keep the public tensor typed as FP8, but pass its bit-identical uint8 view
     # to the kernel; ``mfma_scaled(..., a_format="e4m3")`` interprets the raw
@@ -2755,8 +2772,82 @@ def invoke_gluon_mxfp4_moe_stage1(
         and situ_linear_beta is not None
         and stride_ak == 1
     )
-    if use_e4m3_async:
-        gluon_mxfp4_moe_stage1_e4m3_async_kernel[grid](
+    sorted_total = sorted_token_ids.shape[0]
+    full_sorted_token_ids = sorted_token_ids
+    full_out_2d = out_2d
+    full_out_scale_ptr = out_scale_ptr
+    full_a1_scale = a1_scale
+    full_hidden_states = kernel_hidden_states
+    partial_ok = output_sorted and out_2d is out and out.dim() == 2
+
+    def launch(row_start: int, row_end: int) -> None:
+        # Restrict every per-sorted-row operand to the range; the kernel
+        # offsets the sort's padded extent and the tile experts by its start.
+        sorted_token_ids = full_sorted_token_ids
+        out_2d = full_out_2d
+        out_scale_ptr = full_out_scale_ptr
+        a1_scale = full_a1_scale
+        kernel_hidden_states = full_hidden_states
+        if (row_start, row_end) != (0, sorted_total):
+            if not partial_ok:
+                raise ValueError("a partial sorted-row range needs 2-D sorted output")
+            if (
+                not 0 <= row_start < row_end <= sorted_total
+                or row_start % max(BLOCK_M, CDNA4_SCALE_N_BLOCK)
+                or (row_end != sorted_total and row_end % BLOCK_M)
+            ):
+                raise ValueError(
+                    f"sorted rows [{row_start}, {row_end}) of {sorted_total} are "
+                    f"not whole {BLOCK_M}-row tiles starting on a scale panel"
+                )
+            sorted_token_ids = sorted_token_ids[row_start:row_end]
+            out_2d = out_2d[row_start:row_end]
+            out_scale_ptr = out_scale_ptr[row_start:]
+            a1_scale = a1_scale[row_start:]
+            if input_sorted:
+                kernel_hidden_states = kernel_hidden_states[row_start:]
+        EM = row_end - row_start
+        grid = (triton.cdiv(EM, BLOCK_M) * num_pid_n,)
+        if use_e4m3_async:
+            if (row_start, row_end) != (0, sorted_total):
+                raise NotImplementedError(
+                    "the asynchronous E4M3 stage 1 computes whole sorts only"
+                )
+            gluon_mxfp4_moe_stage1_e4m3_async_kernel[grid](
+                kernel_hidden_states,
+                w1,
+                out_2d,
+                out_scale_ptr,
+                a1_scale,
+                w1_scale,
+                sorted_token_ids,
+                sorted_expert_ids,
+                num_valid_ids_ptr,
+                EM,
+                num_tokens,
+                topk,
+                stride_be,
+                stride_cm,
+                stride_cn,
+                stride_bse_e,
+                stride_se_n_pad,
+                STRIDE_AM=stride_am,
+                BLOCK_M=BLOCK_M,
+                K_PACKED_TOTAL=K_packed_total,
+                I_r=I_r,
+                OUTPUT_K=output_k,
+                SWIGLU_ALPHA=float(swiglu_alpha),
+                SWIGLU_LIMIT=float(swiglu_limit),
+                SWIGLU_BETA=float(swiglu_beta),
+                SITU_LINEAR_BETA=float(situ_linear_beta),
+                num_warps=4,
+            )
+            return
+
+        # Step 4: launch the GEMM. One CTA per (M-tile, N-tile); the per-CTA
+        # expert id is ``sorted_expert_ids[pid_m]``. Interleaved W13 tiles produce
+        # BLOCK_N / 2 outputs; separate gate/up layouts produce BLOCK_N outputs.
+        gluon_mxfp4_moe_stage1_kernel[grid](
             kernel_hidden_states,
             w1,
             out_2d,
@@ -2766,84 +2857,135 @@ def invoke_gluon_mxfp4_moe_stage1(
             sorted_token_ids,
             sorted_expert_ids,
             num_valid_ids_ptr,
+            row_start,
+            N,
+            K,
             EM,
             num_tokens,
             topk,
+            stride_am,
+            stride_ak,
             stride_be,
             stride_cm,
             stride_cn,
             stride_bse_e,
             stride_se_n_pad,
-            STRIDE_AM=stride_am,
-            BLOCK_M=BLOCK_M,
             K_PACKED_TOTAL=K_packed_total,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            NUM_WARPS=NUM_WARPS,
             I_r=I_r,
             OUTPUT_K=output_k,
+            B_GDOT128=bool(b_gdot128),
             SWIGLU_ALPHA=float(swiglu_alpha),
             SWIGLU_LIMIT=float(swiglu_limit),
             SWIGLU_BETA=float(swiglu_beta),
-            SITU_LINEAR_BETA=float(situ_linear_beta),
-            num_warps=4,
+            DO_SITU=situ_linear_beta is not None,
+            SITU_LINEAR_BETA=(
+                1.0 if situ_linear_beta is None else float(situ_linear_beta)
+            ),
+            OUTPUT_SORTED=bool(output_sorted),
+            OUTPUT_QUANTIZED=bool(output_quantized),
+            A_FORMAT=a_format,
+            OUTPUT_FP8=output_format == "e4m3",
+            INPUT_SORTED=bool(input_sorted),
+            NUM_XCDS=_NUM_XCDS,
+            # Narrow tiles finish their A tile before the next one is issued, so
+            # issuing it ahead of the MFMAs hides its latency. The 128-row tile
+            # already overlaps it with its second half.
+            EARLY_A=BLOCK_M <= 64,
+            num_warps=NUM_WARPS,
+            # Interleaving the MFMAs with the next K tile's loads makes the 128-row
+            # E2M1 tile faster. Narrower tiles lose occupancy to the extra registers
+            # and do not gain.
+            **(
+                {"schedule_hint": "mfma-schedule"}
+                if BLOCK_M == 128 and NUM_WARPS == 4 and a_format == "e2m1"
+                else {}
+            ),
         )
-        return out
 
-    # Step 4: launch the GEMM. One CTA per (M-tile, N-tile); the per-CTA
-    # expert id is ``sorted_expert_ids[pid_m]``. Interleaved W13 tiles produce
-    # BLOCK_N / 2 outputs; separate gate/up layouts produce BLOCK_N outputs.
-    gluon_mxfp4_moe_stage1_kernel[grid](
-        kernel_hidden_states,
+    return launch
+
+
+def invoke_gluon_mxfp4_moe_stage1(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    w1_scale=None,
+    a1_scale=None,
+    block_m=128,
+    sorted_weights=None,
+    quant_type=None,
+    activation=None,
+    splitk=1,
+    use_non_temporal_load=False,
+    dst_type=None,
+    b_preshuffled: bool = False,
+    b_gdot128: bool = False,
+    swiglu_alpha: float = 1.0,
+    swiglu_limit: float = 0.0,
+    swiglu_beta: float = 0.0,
+    situ_linear_beta: float | None = None,
+    output_sorted: bool = False,
+    output_quantized: bool = False,
+    out_scale: torch.Tensor | None = None,
+    output_k: int | None = None,
+    a_format: str = "e2m1",
+    output_format: str = "e2m1",
+    input_sorted: bool = False,
+    source_tokens: int | None = None,
+    *,
+    num_warps: int,
+    sorted_rows: tuple[int, int],
+):
+    """Launch a Gluon MXFP4 MoE stage 1 over ``sorted_rows``.
+
+    ``prepare_gluon_mxfp4_moe_stage1(...)(*sorted_rows)``: the same arguments,
+    plus ``sorted_rows``, the ``[start, end)`` range of sorted rows to compute
+    (``(0, len(sorted_token_ids))`` for all of them). Returns ``out``.
+    """
+    prepare_gluon_mxfp4_moe_stage1(
+        hidden_states,
         w1,
-        out_2d,
-        out_scale_ptr,
-        a1_scale,
-        w1_scale,
+        w2,
         sorted_token_ids,
         sorted_expert_ids,
-        num_valid_ids_ptr,
-        N,
-        K,
-        EM,
-        num_tokens,
+        num_valid_ids,
+        out,
         topk,
-        stride_am,
-        stride_ak,
-        stride_be,
-        stride_cm,
-        stride_cn,
-        stride_bse_e,
-        stride_se_n_pad,
-        K_PACKED_TOTAL=K_packed_total,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_WARPS=NUM_WARPS,
-        I_r=I_r,
-        OUTPUT_K=output_k,
-        B_GDOT128=bool(b_gdot128),
-        SWIGLU_ALPHA=float(swiglu_alpha),
-        SWIGLU_LIMIT=float(swiglu_limit),
-        SWIGLU_BETA=float(swiglu_beta),
-        DO_SITU=situ_linear_beta is not None,
-        SITU_LINEAR_BETA=(1.0 if situ_linear_beta is None else float(situ_linear_beta)),
-        OUTPUT_SORTED=bool(output_sorted),
-        OUTPUT_QUANTIZED=bool(output_quantized),
-        A_FORMAT=a_format,
-        OUTPUT_FP8=output_format == "e4m3",
-        INPUT_SORTED=bool(input_sorted),
-        NUM_XCDS=_NUM_XCDS,
-        # Narrow tiles finish their A tile before the next one is issued, so
-        # issuing it ahead of the MFMAs hides its latency. The 128-row tile
-        # already overlaps it with its second half.
-        EARLY_A=BLOCK_M <= 64,
-        num_warps=NUM_WARPS,
-        # Interleaving the MFMAs with the next K tile's loads makes the 128-row
-        # E2M1 tile faster. Narrower tiles lose occupancy to the extra registers
-        # and do not gain.
-        **(
-            {"schedule_hint": "mfma-schedule"}
-            if BLOCK_M == 128 and NUM_WARPS == 4 and a_format == "e2m1"
-            else {}
-        ),
-    )
+        kernelName,
+        w1_scale,
+        a1_scale,
+        block_m,
+        sorted_weights,
+        quant_type,
+        activation,
+        splitk,
+        use_non_temporal_load,
+        dst_type,
+        b_preshuffled,
+        b_gdot128,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
+        situ_linear_beta,
+        output_sorted,
+        output_quantized,
+        out_scale,
+        output_k,
+        a_format,
+        output_format,
+        input_sorted,
+        source_tokens,
+        num_warps=num_warps,
+    )(*sorted_rows)
     return out

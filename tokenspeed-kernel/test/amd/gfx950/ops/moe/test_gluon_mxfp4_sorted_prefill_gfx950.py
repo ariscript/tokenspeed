@@ -36,6 +36,7 @@ if not is_cdna4():
 from tokenspeed_kernel.ops.moe import (  # noqa: E402
     moe_sorted_down,
     moe_sorted_gate_up,
+    moe_sorted_routes,
     prepare_moe_sorted_down_weight,
     warmup_moe_sorted_prefill,
 )
@@ -220,6 +221,52 @@ def test_gate_up_slices_concatenate_into_the_full_intermediate(rows: int) -> Non
         logical = _logical_scales(scales, sorted_rows, width // 32)
         groups = slice(index * width // 32, (index + 1) * width // 32)
         assert torch.equal(logical[real], full_logical[:, groups][real])
+
+
+@pytest.mark.parametrize("rows", [300, 1100])
+def test_gate_up_ranges_write_the_bits_of_one_launch(rows: int) -> None:
+    """Consecutive sorted-row ranges write exactly what one launch writes."""
+    g = torch.Generator(device="cuda").manual_seed(5)
+    w = _experts(
+        _codes(g, EXPERTS, 2 * INTER, HIDDEN // 2),
+        _scales(g, EXPERTS, 2 * INTER, HIDDEN // 32),
+    )
+    inter = INTER
+    capacity = sorted_route_capacity(rows, EXPERTS, TOP_K)
+    x, weights, ids = _inputs(rows, seed=rows)
+
+    def destinations():
+        return (
+            torch.full((capacity, inter // 2), 0xAB, device="cuda", dtype=torch.uint8),
+            torch.full(
+                ((capacity + 31) // 32 * 32, inter // 32),
+                0xCD,
+                device="cuda",
+                dtype=torch.uint8,
+            ),
+        )
+
+    data, scales = destinations()
+    routes = moe_sorted_gate_up(x, weights, ids, w, data, scales)
+    ranged, ranged_scales = destinations()
+    staged = moe_sorted_routes(x, weights, ids, w, ranged, ranged_scales)
+    total = staged.sorted_rows
+    assert total == routes.sorted_ids.shape[0] <= capacity
+    # Ranges past the sort's padded extent write nothing.
+    extent = int(routes.num_valid_ids[0])
+    assert extent < total - 128
+    edges = sorted({0, 128, 1024, extent // 128 * 128, total - 128, total})
+    with assert_no_triton_compile(prefill_stage1.gluon_mxfp4_moe_stage1_kernel):
+        for start, end in zip(edges[:-1], edges[1:]):
+            staged.gate_up_rows(start, end)
+    # The sort leaves ids past its padded extent unset.
+    assert torch.equal(staged.routes.sorted_ids[:extent], routes.sorted_ids[:extent])
+    assert torch.equal(ranged, data)
+    assert torch.equal(ranged_scales, scales)
+    # Ranges must hold whole tiles that start on a scale panel.
+    for start, end in ((16, 1024), (0, 1000), (1024, 1024)):
+        with pytest.raises(ValueError, match="sorted rows"):
+            staged.gate_up_rows(start, end)
 
 
 def test_column_split_down_matches_the_full_projection_columns() -> None:

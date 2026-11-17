@@ -27,7 +27,7 @@ precomputed top-k."""
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import triton
@@ -2226,7 +2226,7 @@ def sorted_route_capacity(rows: int, num_experts: int, top_k: int) -> int:
     return _max_padded_route_capacity(rows * top_k, num_experts, 128)
 
 
-def _package_prefill_gate_up(
+def _package_prefill_sort(
     hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None,
     topk_ids: torch.Tensor,
@@ -2246,13 +2246,20 @@ def _package_prefill_gate_up(
     output_k: int,
     deterministic_order: bool,
     out: torch.Tensor | None,
-) -> tuple[MXFP4SortedRoutes, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sort routes and run the gate/up GEMM into sorted block-scaled rows."""
+) -> tuple[
+    MXFP4SortedRoutes, Callable[..., None], torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Sort routes and prepare the gate/up GEMM into sorted block-scaled rows.
+
+    Returns the routes, the validated gate/up stage 1 still to launch
+    (``stage1(start, end)`` over sorted rows), its intermediate and scale
+    destinations, and the sort's output buffer.
+    """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
         gluon_moe_sorting,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
-        invoke_gluon_mxfp4_moe_stage1,
+        prepare_gluon_mxfp4_moe_stage1,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
         quantize_mxfp8_sorted_routes,
@@ -2337,7 +2344,7 @@ def _package_prefill_gate_up(
         intermediate = intermediate[: sorted_ids.shape[0]]
         intermediate_scale = intermediate_scale[:scale_rows]
     swiglu_alpha, swiglu_limit, swiglu_beta = swiglu_args
-    invoke_gluon_mxfp4_moe_stage1(
+    stage1 = prepare_gluon_mxfp4_moe_stage1(
         q_hidden,
         package_w13.view(torch.uint8),
         None,
@@ -2374,6 +2381,52 @@ def _package_prefill_gate_up(
         n_tokens,
         top_k,
     )
+    return routes, stage1, intermediate, intermediate_scale, out
+
+
+def _package_prefill_gate_up(
+    hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    x_quantized: tuple[torch.Tensor, torch.Tensor] | None,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    package_w13: torch.Tensor,
+    package_w13_scale: torch.Tensor,
+    config,
+    *,
+    expert_start: int,
+    out_dtype: torch.dtype,
+    model_dim: int,
+    activation_format: str,
+    swiglu_args: tuple[float, float, float],
+    situ_linear_beta: float | None,
+    intermediate: torch.Tensor | None,
+    intermediate_scale: torch.Tensor | None,
+    output_k: int,
+    deterministic_order: bool,
+    out: torch.Tensor | None,
+) -> tuple[MXFP4SortedRoutes, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sort routes and run the gate/up GEMM into sorted block-scaled rows."""
+    routes, stage1, intermediate, intermediate_scale, out = _package_prefill_sort(
+        hidden_states,
+        x_quantized,
+        topk_ids,
+        topk_weights,
+        package_w13,
+        package_w13_scale,
+        config,
+        expert_start=expert_start,
+        out_dtype=out_dtype,
+        model_dim=model_dim,
+        activation_format=activation_format,
+        swiglu_args=swiglu_args,
+        situ_linear_beta=situ_linear_beta,
+        intermediate=intermediate,
+        intermediate_scale=intermediate_scale,
+        output_k=output_k,
+        deterministic_order=deterministic_order,
+        out=out,
+    )
+    stage1(0, routes.sorted_ids.shape[0])
     return routes, intermediate, intermediate_scale, out
 
 
@@ -2444,7 +2497,28 @@ def _package_prefill_weights(
     return None
 
 
-def gluon_mxfp4_sorted_gate_up_gfx950(
+class MXFP4SortedGateUp:
+    """Sorted routes whose gate/up GEMM runs over sorted-row ranges.
+
+    ``gate_up_rows(start, end)`` writes the intermediate rows ``[start,
+    end)`` and their scale panels; ranges start on a multiple of 128 (the
+    largest sort block) and end on one or at ``sorted_rows``, the sort's row
+    count (at most ``sorted_route_capacity``). Consecutive ranges covering
+    ``[0, sorted_rows)`` write the bits of one launch, so a caller can act on
+    the first rows while later ranges compute.
+    """
+
+    def __init__(self, routes: MXFP4SortedRoutes, stage1: Callable[..., None]):
+        self.routes = routes
+        self.sorted_rows: int = int(routes.sorted_ids.shape[0])
+        self._stage1 = stage1
+
+    def gate_up_rows(self, start: int, end: int) -> None:
+        """Run gate/up over sorted rows ``[start, end)`` on the current stream."""
+        self._stage1(start, end)
+
+
+def gluon_mxfp4_sorted_routes_gfx950(
     x_quantized: tuple[torch.Tensor, torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -2455,8 +2529,11 @@ def gluon_mxfp4_sorted_gate_up_gfx950(
     swiglu_alpha: float,
     swiglu_limit: float,
     swiglu_beta: float,
-) -> MXFP4SortedRoutes:
-    """Write sorted E2M1 gate/up rows for an all-local expert range.
+) -> MXFP4SortedGateUp:
+    """Sort routes for sorted E2M1 gate/up rows of an all-local expert range.
+
+    Nothing is written until ``gate_up_rows`` runs over the sorted rows; see
+    ``gluon_mxfp4_sorted_gate_up_gfx950`` for one launch over all of them.
 
     Routes are sorted in a fixed order that depends only on ``topk_ids``, so
     ranks holding different intermediate column slices of the same experts
@@ -2477,7 +2554,7 @@ def gluon_mxfp4_sorted_gate_up_gfx950(
             expert layer.
 
     Returns:
-        The sorted route metadata for ``gluon_mxfp4_sorted_down_gfx950``.
+        The sorted routes with their gate/up still to launch.
     """
     package_w13, package_w13_scale = _package_prefill_weights(w13_weight, required=True)
     rows, hidden_dim, _, _ = _mxfp4_input_metadata(x_quantized)
@@ -2523,7 +2600,7 @@ def gluon_mxfp4_sorted_gate_up_gfx950(
         swiglu_args=(swiglu_alpha, swiglu_limit, swiglu_beta),
         situ_linear_beta=None,
     )
-    routes, _, _, _ = _package_prefill_gate_up(
+    routes, stage1, _, _, _ = _package_prefill_sort(
         x_quantized,
         None,
         topk_ids.to(torch.int32).contiguous(),
@@ -2543,7 +2620,42 @@ def gluon_mxfp4_sorted_gate_up_gfx950(
         deterministic_order=True,
         out=None,
     )
-    return routes
+    return MXFP4SortedGateUp(routes, stage1)
+
+
+def gluon_mxfp4_sorted_gate_up_gfx950(
+    x_quantized: tuple[torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight: torch.Tensor,
+    *,
+    intermediate: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    swiglu_alpha: float,
+    swiglu_limit: float,
+    swiglu_beta: float,
+) -> MXFP4SortedRoutes:
+    """Write sorted E2M1 gate/up rows for an all-local expert range.
+
+    ``gluon_mxfp4_sorted_routes_gfx950`` with one gate/up launch over every
+    sorted row; same arguments.
+
+    Returns:
+        The sorted route metadata for ``gluon_mxfp4_sorted_down_gfx950``.
+    """
+    staged = gluon_mxfp4_sorted_routes_gfx950(
+        x_quantized,
+        topk_weights,
+        topk_ids,
+        w13_weight,
+        intermediate=intermediate,
+        intermediate_scale=intermediate_scale,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
+    )
+    staged.gate_up_rows(0, staged.sorted_rows)
+    return staged.routes
 
 
 def gluon_mxfp4_sorted_down_gfx950(

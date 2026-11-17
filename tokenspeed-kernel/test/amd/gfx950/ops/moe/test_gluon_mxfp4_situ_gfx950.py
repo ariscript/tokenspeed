@@ -1363,6 +1363,7 @@ def test_stage1_quantized_output_scale_panels_gfx950(
             out_scale=out_scale,
             output_k=output_k,
             num_warps=max(1, block_m // 32),
+            sorted_rows=(0, rows),
         )
     if error:
         kernel.__getitem__.assert_not_called()

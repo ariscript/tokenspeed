@@ -2435,6 +2435,17 @@ output through LDS so each scattered route row is stored as one contiguous
 run; at 8K tokens that BF16 per-route write and its combine read dominate the
 second GEMM.
 
+The sorted prefill halves (`gluon_mxfp4_sorted_gate_up_gfx950`, then
+`gluon_mxfp4_sorted_down_gfx950` on rows gathered across ranks) can split the
+gate/up GEMM by sorted row: `gluon_mxfp4_sorted_routes_gfx950` sorts and
+returns a handle whose `gate_up_rows(start, end)` launches stage 1 over
+`[start, end)` only. Stage 1 indexes rows, activation scales and outputs by
+sorted row, so the launch slices those operands and offsets the sort's padded
+extent by `ROW_START`; consecutive ranges write the bits of one launch. The
+tile-expert array stays whole and is offset in the kernel, since a pointer
+advanced by a few tiles would lose its 16-byte alignment and compile another
+specialization.
+
 ### gfx1250 MXFP4 experts
 
 On gfx1250, the MoE API selects Gluon kernels with FP8 or MXFP4 activations

@@ -69,6 +69,32 @@ def moe_sorted_gate_up(
     )
 
 
+def moe_sorted_routes(
+    x_quantized: tuple[torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w: torch.nn.Module,
+    intermediate: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+) -> Any:
+    """Sort routes for ``moe_sorted_gate_up`` and leave its GEMM to the caller.
+
+    Same arguments as ``moe_sorted_gate_up``. The returned handle's
+    ``gate_up_rows(start, end)`` writes sorted rows ``[start, end)`` of the
+    intermediate on the current stream; ranges start on a multiple of 128 and
+    end on one or at its ``sorted_rows`` (the sort's row count, at most the
+    capacity). Ranges covering ``[0, sorted_rows)`` write the bits of
+    ``moe_sorted_gate_up``, so a caller can hand the first rows on while later
+    ranges compute. Its ``routes`` is the handle ``moe_sorted_down`` takes.
+    """
+    kernel = select_kernel(
+        "moe", "sorted_routes", dense_format_signature(("x",), (torch.uint8,))
+    )
+    return kernel(
+        x_quantized, topk_weights, topk_ids, w, intermediate, intermediate_scale
+    )
+
+
 def _sorted_down_kernel(dtype: torch.dtype):
     return select_kernel("moe", "sorted_down", dense_format_signature(("x",), (dtype,)))
 
@@ -132,6 +158,7 @@ def warmup_moe_sorted_prefill(
 __all__ = [
     "moe_sorted_down",
     "moe_sorted_gate_up",
+    "moe_sorted_routes",
     "prepare_moe_sorted_down_weight",
     "warmup_moe_sorted_prefill",
 ]

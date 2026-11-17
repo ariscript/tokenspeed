@@ -21,6 +21,8 @@
 
 """Muse Spark's prepared TP4/TP8 policy and decoder fusions."""
 
+from typing import Callable
+
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel._triton import triton
@@ -129,6 +131,15 @@ def _muse_triggered_sdma_strips(pitch: int) -> int:
     return (pitch // 256 + 1) // 2
 
 
+# The SDMA share of the expert-intermediate gather: sorted rows below the
+# split go on the copy engines, one plan chunk per gate/up range, while later
+# ranges compute; the CU gather moves the remaining valid rows. At TP8 from
+# 6145 to 8192 tokens (padded sort extents of ~57K-73K rows), sending 49152
+# rows in 16384-row ranges cut gate/up + gather + down by 7-8% on MI350X.
+_MUSE_TRIGGERED_GATHER_SPLIT_ROWS = 49152
+_MUSE_TRIGGERED_GATHER_CHUNK_ROWS = 16384
+
+
 _MUSE_ROW_GATHER_PROGRAMS = 128
 _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
@@ -212,11 +223,15 @@ class MuseIrisState:
             size += allocation_bytes(
                 (_MUSE_ROW_SCATTER_PROGRAMS, world_size), torch.uint32
             )
-        if intermediate_gather_max_rows:
-            for shape, dtype in MuseIrisState._intermediate_gather_buffers(
+        gather_buffers = (
+            MuseIrisState._intermediate_gather_buffers(
                 intermediate_gather_max_rows, world_size
-            ):
-                size += allocation_bytes(shape, dtype)
+            )
+            if intermediate_gather_max_rows
+            else ()
+        )
+        for shape, dtype in gather_buffers:
+            size += allocation_bytes(shape, dtype)
         column_rows = MuseIrisState._column_routes_max_rows(
             max_numel,
             world_size=world_size,
@@ -234,6 +249,10 @@ class MuseIrisState:
         pitch = MuseIrisState._triggered_owner_pitch(
             max_numel, world_size, attention_reduce_scatter_transport
         )
+        if pitch and gather_buffers:
+            # Every rank's slices gather into one arena the SDMA plan writes.
+            ((slice_arena_bytes,), _), *_ = gather_buffers
+            size += allocation_bytes((world_size * slice_arena_bytes,), torch.uint8)
         if pitch:
             # The peers' copied strips land in an inbox, and their GEMMs mark
             # the pulled ones in ready words; the plan's gates fit the headroom.
@@ -330,8 +349,15 @@ class MuseIrisState:
         sorted_rows = sorted_route_capacity(max_rows, _MUSE_EXPERTS, _MUSE_TOPK)
         slice_width = _MUSE_INTERMEDIATE // world_size
         return (
-            ((sorted_rows, slice_width // 2), torch.uint8),
-            ((triton.cdiv(sorted_rows, 32) * 32, slice_width // 32), torch.uint8),
+            # This rank's sorted slice rows, then their scale panels: one
+            # buffer, which the SDMA gather's plan sends from.
+            (
+                (
+                    sorted_rows * (slice_width // 2)
+                    + triton.cdiv(sorted_rows, 32) * 32 * (slice_width // 32),
+                ),
+                torch.uint8,
+            ),
             ((max_rows * _MUSE_TOPK,), torch.float32),
             ((max_rows, _MUSE_ROUTE_WIDTH // world_size), torch.bfloat16),
             ((2, _MUSE_INTERMEDIATE_GATHER_PROGRAMS, world_size), torch.uint32),
@@ -463,16 +489,30 @@ class MuseIrisState:
                 )
             ]
             if intermediate_gather_max_rows
-            else [None] * 6
+            else [None] * 5
         )
         (
-            self.intermediate_slice,
-            self.intermediate_slice_scales,
+            self.intermediate_slice_arena,
             self.route_partial_squares,
             self.route_column_sums,
             self.intermediate_gather_flags,
             self.column_norm_flags,
         ) = buffers
+        self.intermediate_slice = None
+        self.intermediate_slice_scales = None
+        if intermediate_gather_max_rows:
+            sorted_rows = sorted_route_capacity(
+                intermediate_gather_max_rows, _MUSE_EXPERTS, _MUSE_TOPK
+            )
+            slice_width = _MUSE_INTERMEDIATE // self.world_size
+            data_bytes = sorted_rows * (slice_width // 2)
+            arena = self.intermediate_slice_arena
+            self.intermediate_slice = arena[:data_bytes].view(
+                sorted_rows, slice_width // 2
+            )
+            self.intermediate_slice_scales = arena[data_bytes:].view(
+                -1, slice_width // 32
+            )
         # Expert TP8 decode batches below the reduce-scatter window complete
         # each route's 512-column slice on its owner rank (see
         # reduce_column_routed_rmsnorm_sum).
@@ -550,6 +590,10 @@ class MuseIrisState:
         # engines, for the row counts its triggered plan serves.
         self.attention_reduce_scatter_transport = attention_reduce_scatter_transport
         self.triggered_reduce_scatter = None
+        # And the first sorted rows of the expert-intermediate gather, for the
+        # same row counts: both plans share the copy queues, so a served batch
+        # runs one round of each per layer, alternating.
+        self.triggered_gather = None
         pitch = self._triggered_owner_pitch(
             capacity, self.world_size, attention_reduce_scatter_transport
         )
@@ -576,6 +620,22 @@ class MuseIrisState:
                 min_rows=_MUSE_TRIGGERED_REDUCE_SCATTER_MIN_ROWS,
                 timeout=_MUSE_TRIGGERED_TIMEOUT_SECONDS,
             )
+            if intermediate_gather_max_rows:
+                from tokenspeed_kernel.ops.communication._iris.muse_spark.triggered_gather import (
+                    TriggeredSortedSliceGather,
+                )
+
+                slice_width = _MUSE_INTERMEDIATE // self.world_size
+                self.triggered_gather = TriggeredSortedSliceGather(
+                    peers.ctx,
+                    self.intermediate_slice_arena,
+                    capacity=self.intermediate_slice.shape[0],
+                    slice_bytes=slice_width // 2,
+                    panel_bytes=slice_width,
+                    split_rows=_MUSE_TRIGGERED_GATHER_SPLIT_ROWS,
+                    chunk_rows=_MUSE_TRIGGERED_GATHER_CHUNK_ROWS,
+                    timeout=_MUSE_TRIGGERED_TIMEOUT_SECONDS,
+                )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy.
@@ -768,11 +828,12 @@ class MuseIrisState:
         return trs.run(x, weight, output)
 
     def warmup_triggered_reduce_scatter(self) -> None:
-        """Run and check one SDMA round before serving, compiling its kernels.
+        """Run and check one round of each SDMA plan before serving.
 
-        Startup's warmup prefill fills a whole chunk, which the SDMA plan
-        serves, so this also runs the CU pull once at the attention output's
-        width: it serves every other owned-row count.
+        Compiles their kernels, into the storage serving uses. Startup's
+        warmup prefill fills a whole chunk, which the SDMA plans serve, so
+        this also runs the CU pull once at the attention output's width: it
+        serves every other owned-row count.
         """
         trs = self.triggered_reduce_scatter
         if trs is None:
@@ -795,12 +856,39 @@ class MuseIrisState:
         self.reduce_scatter_owned_rows(
             self.all_reduce.producer.data[: rows * trs.width].view(rows, trs.width)
         )
+        gather = self.triggered_gather
+        if gather is None:
+            return
+        # One gather round after the attention round, as serving alternates
+        # them, into the storage serving gathers into; no rows are valid, so
+        # the CU gather copies nothing.
+        device = self.all_reduce.device
+        gather.start()
+        for chunk in range(gather.chunks):
+            gather.mark(chunk)
+        self._launch_intermediate_gather(
+            torch.zeros((32,), dtype=torch.int32, device=device),
+            torch.zeros((2,), dtype=torch.int32, device=device),
+            gather.gathered_rows,
+            gather.gathered_scales,
+            self.intermediate_gather_min_rows,
+            row_start=gather.split_rows,
+            compile_only=False,
+        )
+        gather.wait()
+        gather.finish()
+        torch.cuda.synchronize()
+        gather.raise_recorded_errors()
 
     def close(self) -> None:
-        """Collective: release the SDMA plan, raising any error it recorded."""
+        """Collective: release the SDMA plans, raising any error they recorded."""
+        # In the order they were prepared, as plans sharing queues must close.
         if self.triggered_reduce_scatter is not None:
             self.triggered_reduce_scatter.close()
             self.triggered_reduce_scatter = None
+        if self.triggered_gather is not None:
+            self.triggered_gather.close()
+            self.triggered_gather = None
 
     def reduce_scatter_owned_rows(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce full BF16 rows and finish all peer reads before returning."""
@@ -1030,9 +1118,60 @@ class MuseIrisState:
             output,
             output_scales,
             rows,
+            row_start=0,
             compile_only=False,
         )
         return output, output_scales
+
+    def gate_up_gather_project(
+        self,
+        staged,
+        rows: int,
+        project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Run ``staged``'s gate/up, gather the slices and return ``project(rows, scales)``.
+
+        ``staged`` comes from ``moe_sorted_routes`` into the acquired slot.
+        ``project`` receives the gathered full-width rows and scale panels (the
+        layout of ``gather_expert_intermediate``) and must queue every read of
+        them on the current stream before returning; the rows may be borrowed
+        from this state's storage, so nothing may read them afterwards.
+
+        For the row counts the SDMA attention reduce-scatter serves
+        (``projects_reduce_scatter``), the copy engines send the first sorted
+        rows while later gate/up ranges compute, and the CU gather moves the
+        rest. This round of the gather's plan must follow the layer's round of
+        the attention plan, as the two share copy queues: callers keep the
+        attention plan to layers whose experts run this gather. Otherwise one
+        gate/up launch and ``gather_expert_intermediate``.
+        """
+        routes = staged.routes
+        assert self.can_gather_expert_intermediate(rows) and routes.rows == rows
+        gather = self.triggered_gather
+        if gather is None or not self.projects_reduce_scatter(rows):
+            staged.gate_up_rows(0, staged.sorted_rows)
+            return project(*self.gather_expert_intermediate(routes, rows))
+        sorted_rows = staged.sorted_rows
+        gathered_rows = gather.gathered_rows[:sorted_rows]
+        gathered_scales = gather.gathered_scales[: triton.cdiv(sorted_rows, 32) * 32]
+        gather.start()
+        for start, end, chunk in gather.ranges(sorted_rows):
+            staged.gate_up_rows(start, end)
+            if chunk is not None:
+                gather.mark(chunk)
+        self._launch_intermediate_gather(
+            routes.sorted_ids,
+            routes.num_valid_ids,
+            gathered_rows,
+            gathered_scales,
+            rows,
+            row_start=gather.split_rows,
+            compile_only=False,
+        )
+        gather.wait()
+        output = project(gathered_rows, gathered_scales)
+        gather.finish()
+        return output
 
     def column_routed_rmsnorm_sum(
         self,
@@ -1104,6 +1243,7 @@ class MuseIrisState:
                 (32, _MUSE_INTERMEDIATE // 32), dtype=torch.uint8, device=device
             ),
             rows,
+            row_start=0,
             compile_only=True,
         )
         self._launch_column_norm(
@@ -1129,6 +1269,7 @@ class MuseIrisState:
         output_scales: torch.Tensor,
         rows: int,
         *,
+        row_start: int,
         compile_only: bool,
     ) -> None:
         kernel = iris_pull_allgather_sorted_mxfp4_slices
@@ -1143,6 +1284,7 @@ class MuseIrisState:
             self.intermediate_gather_flags,
             self.all_reduce.peers.addresses[: self.world_size],
             rows,
+            row_start,
         )
         options = dict(
             RANK=self.all_reduce.rank_in_group,

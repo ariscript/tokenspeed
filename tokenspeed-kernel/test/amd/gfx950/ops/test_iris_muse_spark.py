@@ -24,6 +24,7 @@
 import re
 import socket
 import traceback
+from contextlib import nullcontext
 from functools import partial
 
 import pytest
@@ -3461,6 +3462,170 @@ def _muse_triggered_reduce_scatter_worker(rank, world_size, device):
 
         check_rounds(trs, project, rows * 3)
         trs.close()
+
+
+def _muse_triggered_gather_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.column_split import (
+        iris_pull_allgather_sorted_mxfp4_slices,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.triggered_gather import (
+        iris_triggered_gather_mark,
+        iris_triggered_gather_wait,
+    )
+    from tokenspeed_kernel.ops.communication.iris import configure_iris
+    from tokenspeed_kernel.ops.moe import moe_sorted_routes
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import prefill_stage1
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+        empty_swizzled_cdna4_mxfp4_scale,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx950_moe_weights,
+    )
+    from utils import assert_no_triton_compile
+
+    experts, top_k, hidden, inter = 256, 8, 4096, 4096 // world_size
+    configure_iris(heap_size=None, allocator_type=None, engines=("sdma",))
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=8192 * 8192,
+        enable_lamport=False,
+        owned_route_max_rows=8192,
+        intermediate_gather_max_rows=8192,
+        attention_reduce_scatter_transport="sdma",
+        all_reduce=None,
+        device=device,
+    )
+    assert state.triggered_gather is not None
+    state.warmup_triggered_reduce_scatter()
+    # This rank's gate/up slice of every expert (codes and E8M0 scales).
+    g = torch.Generator(device=device).manual_seed(100 + rank)
+    w = torch.nn.Module()
+    w.w13_weight = torch.nn.Parameter(
+        torch.randint(0, 256, (experts, 2 * inter, hidden // 2), device=device,
+                      dtype=torch.uint8, generator=g),
+        requires_grad=False,
+    )  # fmt: skip
+    w.w13_weight_scale = torch.nn.Parameter(
+        torch.randint(118, 124, (experts, 2 * inter, hidden // 32), device=device,
+                      dtype=torch.uint8, generator=g),
+        requires_grad=False,
+    )  # fmt: skip
+    w.w2_weight = torch.nn.Parameter(
+        torch.zeros((experts, hidden, inter // 2), device=device, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        torch.full(
+            (experts, hidden, inter // 32), 127, device=device, dtype=torch.uint8
+        ),
+        requires_grad=False,
+    )
+    w.w13_input_layout = "concatenated"
+    w.num_experts = experts
+    w.num_local_experts = experts
+    w.top_k = top_k
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, w)
+    projection = (torch.randn((8192, 1024), generator=g, device=device) / 32).to(
+        torch.bfloat16
+    )
+
+    def inputs(rows, seed):
+        # Activations and routes are replicated: the same on every rank.
+        gen = torch.Generator(device=device).manual_seed(seed)
+        packed = torch.randint(0, 256, (rows, hidden // 2), device=device,
+                               dtype=torch.uint8, generator=gen)  # fmt: skip
+        scales = empty_swizzled_cdna4_mxfp4_scale(rows, hidden // 32, device=device)
+        scales.copy_(torch.randint(118, 124, scales.shape, device=device,
+                                   dtype=torch.uint8, generator=gen))  # fmt: skip
+        ids = torch.rand(rows, experts, device=device, generator=gen).topk(top_k, -1)
+        weights = torch.rand(rows, top_k, device=device, generator=gen)
+        attention = torch.randn((rows, 1024), generator=gen, device=device)
+        return (
+            (packed, scales),
+            weights,
+            ids.indices.to(torch.int32).contiguous(),
+            (attention.to(torch.bfloat16)),
+        )
+
+    gather = state.triggered_gather
+    served = 0
+    first_round = gather.plan.round
+    compiles = None
+    kernels = (
+        prefill_stage1.gluon_mxfp4_moe_stage1_kernel,
+        iris_pull_allgather_sorted_mxfp4_slices,
+        iris_triggered_gather_mark,
+        iris_triggered_gather_wait,
+    )
+    # Rows the plans serve (more than 6144) interleaved with rows they leave to
+    # the CU paths; every served batch runs the attention round, then the
+    # gather round, as a layer does.
+    for step, rows in enumerate((8192, 6145, 4096, 7001, 6144, 8191) * 4):
+        x, weights, ids, attention = inputs(rows, seed=step)
+        serves = state.projects_reduce_scatter(rows)
+        assert serves == (rows > 6144)
+        intermediate, intermediate_scale = state.acquire_expert_intermediate(rows)
+        reference = moe_sorted_routes(
+            x, weights, ids, w, intermediate, intermediate_scale
+        )
+        reference.gate_up_rows(0, reference.sorted_rows)
+        expected_rows, expected_scales = (
+            t.clone() for t in state.gather_expert_intermediate(reference.routes, rows)
+        )
+        if serves:
+            state.project_reduce_scatter_owned_rows(attention, projection)
+            # Stale or early reads of the slices or the gathered rows would
+            # differ from the CU gather. Peers may copy into this rank's
+            # gathered rows once every rank passed the last round's fence, so
+            # every rank poisons before any rank starts.
+            state.intermediate_slice_arena.fill_(0xFF)
+            gather.gathered.fill_(0xFF)
+            torch.cuda.synchronize()
+            dist.barrier()
+            served += 1
+        with assert_no_triton_compile(*kernels) if served > 1 else nullcontext():
+            staged = moe_sorted_routes(
+                x, weights, ids, w, intermediate, intermediate_scale
+            )
+            actual_rows, actual_scales = state.gate_up_gather_project(
+                staged, rows, lambda r, s: (r.clone(), s.clone())
+            )
+        torch.cuda.synchronize()
+        routes = staged.routes
+        extent = int(routes.num_valid_ids[0])
+        real = (routes.sorted_ids[:extent] & 0xFFFFFF) < rows
+        assert torch.equal(
+            actual_rows[:extent][real], expected_rows[:extent][real]
+        ), f"step {step}, {rows} rows"
+        panels = -(-extent // 32) * 32
+        assert torch.equal(
+            actual_scales[:panels], expected_scales[:panels]
+        ), f"step {step}, {rows} rows"
+    gather.raise_recorded_errors()
+    state.triggered_reduce_scatter.raise_recorded_errors()
+    assert gather.plan.round == first_round + served
+    state.close()
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_muse_triggered_gather_matches_the_cu_gather(world_size):
+    """The SDMA expert-intermediate gather returns the CU gather's rows."""
+    _skip_if_unsupported(world_size, "Muse SDMA gather")
+    pytest.importorskip("xio", reason="rocm-xio is required for SDMA")
+    try:
+        import iris.experimental.plan.gluon  # noqa: F401
+    except ImportError:
+        pytest.skip("Iris has no Gluon triggered plans")
+    _spawn_and_collect(
+        _communication_worker,
+        (world_size, _get_open_port(), _muse_triggered_gather_worker, "nccl"),
+        world_size,
+    )
 
 
 @pytest.mark.parametrize("world_size", [8])

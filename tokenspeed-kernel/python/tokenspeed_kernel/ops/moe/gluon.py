@@ -1499,6 +1499,9 @@ if platform.is_amd:
         gluon_mxfp4_sorted_gate_up_gfx950 as _sorted_gate_up_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        gluon_mxfp4_sorted_routes_gfx950 as _sorted_routes_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         gluon_mxfp_dynamic_mxfp4_fused_moe,
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
@@ -1964,6 +1967,39 @@ if platform.is_amd:
             raise ValueError("sorted gate/up requires every expert to be local")
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         return _sorted_gate_up_gfx950(
+            x_quantized,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            intermediate=intermediate,
+            intermediate_scale=intermediate_scale,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+        )
+
+    @register_kernel(
+        "moe",
+        "sorted_routes",
+        name="gluon_mxfp4_sorted_routes_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures("x", "dense", {torch.uint8}),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_sorted_routes_gfx950(
+        x_quantized: tuple[torch.Tensor, torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        w: torch.nn.Module,
+        intermediate: torch.Tensor,
+        intermediate_scale: torch.Tensor,
+    ) -> Any:
+        """gfx950 kernel of :func:`tokenspeed_kernel.ops.moe.moe_sorted_routes`."""
+        if w.num_local_experts != w.num_experts:
+            raise ValueError("sorted gate/up requires every expert to be local")
+        swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        return _sorted_routes_gfx950(
             x_quantized,
             topk_weights,
             topk_ids,
